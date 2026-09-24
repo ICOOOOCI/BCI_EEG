@@ -4,7 +4,8 @@
 启动界面：1=自由输入（默认），2=原有提示测试；SPACE/ENTER开始，ESC退出。
 自由输入：自行注视字符，每轮真实LSL EEG经FBCCA识别后写入顶部OUTPUT框。
 电脑键盘SPACE暂停/继续；屏幕内SPACE目标插入空格，BACK目标删除上一字符。
-保持M3七子带、五谐波、40目标映射和现有LSL快速联调处理。
+采用4×10 QWERTY布局；按新行列重排40类及频率（8–17.6 Hz）。
+保持M3七子带、五谐波和现有LSL快速联调处理。
 本版不是个人校准程序，也没有自动空闲检测；不要将快速模式当最终实验验证。
 不包含迷宫，不注入操作系统按键，不保存EEG/CSV/NPZ/XDF/实验日志文件。
 算法函数仍可import调用；import不会安装依赖或启动闪烁。
@@ -306,14 +307,23 @@ class Target:
     frequency_hz: float
     phase_rad: float = 0.0    # 普通正弦频率编码；没有冒充JFPM或引入相位分类。
 
+    @property
+    def display_label(self) -> str:
+        # 视觉标签与输入语义分开；空白键仍是可识别的SPACE目标。
+        return {"SPACE": "", "BACK": "<-"}.get(self.symbol, self.symbol)
+
 
 # 唯一目标表：界面、参考信号、事件、预测字符和评估均从这里读取。
 KEY_ROWS = (
-    tuple("ABCDEFGH"), tuple("IJKLMNOP"), tuple("QRSTUVWX"),
-    tuple("YZ012345"), ("6", "7", "8", "9", "SPACE", "BACK", ".", ","),
+    tuple("1234567890"),
+    tuple("QWERTYUIOP"),
+    (*tuple("ASDFGHJKL"), "BACK"),
+    ("SPACE", *tuple("ZXCVBNM,.")),
 )
-TARGETS = tuple(Target(r * 8 + c + 1, KEY_ROWS[r][c], r, c, round(8 + c + .2 * r, 1))
-                for r in range(5) for c in range(8))
+# 频率继续使用原行列公式；新布局的范围为8–17.6 Hz，不能沿用旧字符映射。
+TARGETS = tuple(Target(i + 1, symbol, r, c, round(8 + c + .2 * r, 1))
+                for i, (r, c, symbol) in enumerate(
+                    (r, c, symbol) for r, row in enumerate(KEY_ROWS) for c, symbol in enumerate(row)))
 BENCHMARK_FREQUENCIES_HZ = np.asarray([t.frequency_hz for t in TARGETS])
 M3_BANDS = tuple((float(8 * n - 2), 90.0) for n in range(1, 8))
 DEFAULT_WINDOW_S = 2.0
@@ -1340,6 +1350,30 @@ def preflight_review(cfg: Config, collector: ContinuousLSL) -> dict:
 
 
 # ======================== 主线程：预创建刺激、逐帧更新、试次管理 ========================
+def calculate_keyboard_layout(cfg: Config, window_size: Sequence[float]
+                              ) -> tuple[np.ndarray, float, float, float]:
+    """按目标表计算布局；为顶部输出/状态和底部提示预留空间，无需创建窗口。"""
+    width, height = map(float, window_size)
+    if not all(math.isfinite(value) and value > 0 for value in (width, height)):
+        raise ValueError("窗口宽高必须为有限正数")
+    rows, cols = len(KEY_ROWS), max(map(len, KEY_ROWS))
+    top_reserved = cfg.output_box_height_px + cfg.output_box_margin_px + 70.0
+    bottom_reserved = 70.0
+    scale = min(1., (width - 80) / (cols * cfg.key_size_px + (cols - 1) * cfg.key_gap_px),
+                (height - top_reserved - bottom_reserved) /
+                (rows * cfg.key_size_px + (rows - 1) * cfg.key_gap_px))
+    if scale <= 0 or (scale < 1 and not cfg.allow_layout_scaling):
+        raise RuntimeError("屏幕不足以容纳固定按键布局；请更换分辨率或允许等比例缩放")
+    key, gap = cfg.key_size_px * scale, cfg.key_gap_px * scale
+    center_y = (bottom_reserved - top_reserved) / 2
+    positions = np.asarray([
+        ((target.col - (cols - 1) / 2) * (key + gap),
+         center_y + ((rows - 1) / 2 - target.row) * (key + gap))
+        for target in TARGETS
+    ])
+    return positions, key, gap, scale
+
+
 class PsychoPyKeyboard:
     def __init__(self, cfg: Config, collector: ContinuousLSL, markers: EventMarkers, ledger: TrialLedger):
         from psychopy import visual, event, logging
@@ -1366,32 +1400,26 @@ class PsychoPyKeyboard:
     def _build_window(self) -> None:
         visual, cfg = self.visual, self.cfg
         self.win = visual.Window(size=cfg.window_size, fullscr=cfg.full_screen, screen=cfg.screen_index,
-            units="pix", color=(-1, -1, -1), colorSpace="rgb", waitBlanking=True,
+            units="pix", color=(-.78, -.77, -.73), colorSpace="rgb", waitBlanking=True,
             allowGUI=not cfg.full_screen, checkTiming=False, autoLog=False)
         self.win.mouseVisible = False
         width, height = map(float, self.win.size)
-        top_reserved = cfg.output_box_height_px + cfg.output_box_margin_px + 70.0
-        bottom_reserved = 70.0
-        scale = min(1., (width - 80) / (8 * cfg.key_size_px + 7 * cfg.key_gap_px),
-                    (height - top_reserved - bottom_reserved) / (5 * cfg.key_size_px + 4 * cfg.key_gap_px))
-        if scale <= 0 or (scale < 1 and not cfg.allow_layout_scaling):
-            raise RuntimeError("屏幕不足以容纳固定按键布局；请更换分辨率或允许等比例缩放")
-        key, gap = cfg.key_size_px * scale, cfg.key_gap_px * scale
+        self.positions, key, gap, scale = calculate_keyboard_layout(cfg, (width, height))
         self.key_size, self.gap_size, self.layout_scale = key, gap, scale
-        grid_height = 5 * key + 4 * gap
-        top_limit = height / 2 - top_reserved
-        bottom_limit = -height / 2 + bottom_reserved
-        grid_center_y = (top_limit + bottom_limit) / 2
-        self.positions = np.asarray([((target.col - 3.5) * (key + gap),
-                                      grid_center_y + (2 - target.row) * (key + gap)) for target in TARGETS])
+        self._static_colors = np.tile((.72, .58, .82), (len(TARGETS), 1))
+        # 批量绘制边框，避免逐帧增加40个Rect对象的绘制开销。
+        self.key_borders = visual.ElementArrayStim(self.win, nElements=len(TARGETS), units="pix",
+            xys=self.positions, sizes=(key + 4 * scale, key + 4 * scale), elementTex=None, elementMask=None,
+            colors=np.tile((-.88, -.89, -.84), (len(TARGETS), 1)), colorSpace="rgb", autoLog=False)
         self.squares = visual.ElementArrayStim(self.win, nElements=len(TARGETS), units="pix",
             xys=self.positions, sizes=(key, key), elementTex=None, elementMask=None,
-            colors=np.full((len(TARGETS), 3), -.2), colorSpace="rgb", autoLog=False)
+            colors=self._static_colors, colorSpace="rgb", autoLog=False)
         self.labels = []
         for target, pos in zip(TARGETS, self.positions):
-            label_height = key * (.18 if len(target.symbol) > 1 else .30)
-            self.labels.append(visual.TextStim(self.win, text=target.symbol, pos=pos,
-                height=label_height, units="pix", color="white", bold=True, autoLog=False))
+            label_height = key * (.32 if len(target.display_label) > 1 else .42)
+            self.labels.append(visual.TextStim(self.win, text=target.display_label, pos=pos,
+                height=label_height, units="pix", color=(-.64, -.67, -.58),
+                colorSpace="rgb", bold=False, autoLog=False))
         self.outline = visual.Rect(self.win, width=key + 8 * scale, height=key + 8 * scale,
             fillColor=None, lineColor="red", lineWidth=3, units="pix", autoLog=False)
         self.triangle = visual.ShapeStim(self.win, vertices=((-8*scale, -6*scale), (8*scale, -6*scale), (0, 6*scale)),
@@ -1418,7 +1446,6 @@ class PsychoPyKeyboard:
             color="white", autoLog=False)
         self.message = visual.TextStim(self.win, text="", pos=(0, -15),
             height=min(26, height/32), wrapWidth=width*.88, color="white", autoLog=False)
-        self._static_colors = np.full((len(TARGETS), 3), -.2)
         # 预热字体/绘制对象，避免第一次刺激时才上传纹理。
         for _ in range(30):
             self._check_abort()
@@ -1453,7 +1480,8 @@ class PsychoPyKeyboard:
         self.display_info = {"window_size_reported": tuple(map(int, self.win.size)),
             "framebuffer_size_reported": tuple(map(int, framebuffer)), "content_scale_factor": content_scale,
             "refresh_hz_measured": self.refresh_hz, "key_size_pix_units": key, "gap_pix_units": gap,
-            "layout_scale": scale, "target_viewing_distance_cm": cfg.viewing_distance_cm,
+            "layout_scale": scale, "layout_rows": len(KEY_ROWS), "layout_cols": max(map(len, KEY_ROWS)),
+            "target_viewing_distance_cm": cfg.viewing_distance_cm,
             "declared_screen_diagonal_inches": cfg.screen_diagonal_inches,
             "stimulus_frames": len(self.rgb_frames), "scheduled_stimulus_s": len(self.rgb_frames)/self.refresh_hz,
             "static_render_check": check, "physical_timing_measured": False, "luminance_gamma_calibrated": False}
@@ -1501,6 +1529,7 @@ class PsychoPyKeyboard:
     def _draw_keys(self, target_id: Optional[int] = None, flicker_rgb: Optional[np.ndarray] = None,
                    show_outline: bool = False) -> None:
         self.squares.colors = self._static_colors if flicker_rgb is None else flicker_rgb
+        self.key_borders.draw()
         self.squares.draw()
         for label in self.labels:
             label.draw()
@@ -1554,7 +1583,7 @@ class PsychoPyKeyboard:
         self._phase(record, "PREPARE")
         if free:
             self.header.text = f"FREE | Selection {record.trial_id} | Choose your next character"
-            self.footer.text = "Keyboard SPACE: pause | ESC: exit | Gaze SPACE/BACK: insert space/delete"
+            self.footer.text = "Keyboard SPACE: pause | ESC: exit | Blank key: space | <-: delete"
         else:
             self.header.text = f"Block {record.block_id}/{cfg.blocks} | Trial {record.trial_id}/{cfg.blocks*40} | Look at {target.symbol}"
             self.footer.text = "ESC: stop | Follow the red triangle"
@@ -1582,7 +1611,7 @@ class PsychoPyKeyboard:
         try:
             for frame, rgb in enumerate(self.rgb_frames):
                 self._check_abort()
-                # target_id=None时不显示红三角/红框，40个频率与原算法保持不变。
+                # target_id=None时不显示红三角/红框；所有目标按同一灰度正弦公式闪烁。
                 self._draw_keys(target_id, rgb, show_outline=False)
                 if frame == 0:
                     self.win.callOnFlip(self.markers.mark, onset_event)
@@ -1677,7 +1706,7 @@ class PsychoPyKeyboard:
                     f"Selected: {label}\n\n"
                     "SPACE or ENTER: start   ESC: exit\n\n"
                     "Free mode: keyboard SPACE pauses/resumes.\n"
-                    "Gaze at on-screen SPACE/BACK to insert space/delete.\n"
+                    "Blank bottom-left key: insert space.  <-: delete.\n"
                     "No automatic calibration or idle detection.")
                 previous = selected
             self._draw_status()
@@ -1905,7 +1934,8 @@ def main() -> dict:
             f"界面/采集依赖导入失败，当前Python：{sys.executable}\n"
             "这台电脑请先用同目录的 start_keyboard_dual_mode.cmd 启动（优先使用Python 3.10）。\n"
             "原始错误：" + str(exc)) from exc
-    print("安全提示：此程序呈现8–15.8Hz视觉闪烁。对闪光敏感、有光敏性癫痫史者不要自行测试；"
+    print(f"安全提示：此程序呈现{BENCHMARK_FREQUENCIES_HZ.min():g}–{BENCHMARK_FREQUENCIES_HZ.max():g}Hz视觉闪烁。"
+          "对闪光敏感、有光敏性癫痫史者不要自行测试；"
           "出现眼部不适、头痛、眩晕等应立即按ESC停止。先阅读风险并核对接线，程序不会直接开始闪烁。")
     print("模式：启动界面1=自由输入（默认），2=提示测试；没有迷宫或操作系统按键注入。")
     print("自由输入不需要先做40轮测试；本版未添加个人校准或空闲检测，休息时按SPACE暂停。")

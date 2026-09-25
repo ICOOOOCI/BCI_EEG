@@ -5,9 +5,9 @@
 自由输入：自行注视字符，每轮真实LSL EEG经FBCCA识别后写入顶部OUTPUT框。
 电脑键盘SPACE暂停/继续；屏幕内SPACE目标插入空格，BACK目标删除上一字符。
 采用4×10 QWERTY布局；按新行列重排40类及频率（8–17.6 Hz）。
-保持M3七子带、五谐波和现有LSL快速联调处理。
-本版不是个人校准程序，也没有自动空闲检测；不要将快速模式当最终实验验证。
-不包含迷宫，不注入操作系统按键，不保存EEG/CSV/NPZ/XDF/实验日志文件。
+保持M3七子带、五谐波和现有LSL采集流程。
+本版不是个人校准程序，也没有自动空闲检测；快速模式只用于跳过启动核验交互。
+不包含迷宫，不注入操作系统按键；每轮实验记录保存为JSON和NPZ。
 算法函数仍可import调用；import不会安装依赖或启动闪烁。
 
 UI API references checked 2026-09-17:
@@ -160,6 +160,8 @@ for _name in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS"):
 
 import json
 import math
+import os
+from pathlib import Path
 import queue
 import threading
 import time
@@ -184,9 +186,8 @@ class Config:
     # debug_2s: 刺激2 s, 分析2 s; paper_window_1p25s: 两者1.25 s;
     # paper_offline_5s: 两者5 s。最后一种做240次时同时设置 blocks=6。
     protocol: str = "debug_2s"
-    # 快速调试模式：优先进入程序。临时放宽LSL时间戳/显示时序的严格实验级检查。
-    # 仅用于当前联调，不应拿本模式下的数据作为最终论文实验结果。
-    quick_entry_mode: bool = True
+    # 快速模式只影响启动核验交互；不放宽时间戳、质量或显示时序门控。
+    quick_entry_mode: bool = False
     blocks: int = 1
     random_seed: int = 20260916
     cue_s: float = 0.5
@@ -209,10 +210,25 @@ class Config:
     data_wait_timeout_s: float = 8.0
     clock_refresh_s: float = 1.0
     max_clock_step_s: float = 0.002
+    clock_slew_rate_s_per_s: float = 0.001
     max_receive_age_s: float = 2.0
     max_gap_factor: float = 1.5  # 发现一个明确缺样(2个采样间隔)也拒绝，不跨缺口补齐。
+    hard_gap_factor: float = 2.0
     rate_tolerance: float = 0.02
-    min_valid_channels: int = 8
+    hard_rate_tolerance: float = 0.05
+    max_warning_gaps: int = 1
+    max_warning_frame_anomalies: int = 1
+    min_valid_channels: int = 6
+    max_warning_bad_channels: int = 2
+    quality_max_abs: Optional[float] = None
+    quality_rail_min: Optional[float] = None
+    quality_rail_max: Optional[float] = None
+    quality_clip_tolerance: float = 0.0
+    quality_jump_z: float = 12.0
+    rejection_enabled: bool = False
+    rejection_min_score: Optional[float] = None
+    rejection_min_margin: Optional[float] = None
+    record_root: str = "session_records"
     # AUTO 从流元数据读取；缺失时不会猜测单位。对话框允许人工明确覆盖。
     input_unit: str = "AUTO"
     upstream_filter_description: str = "UNKNOWN"
@@ -281,6 +297,32 @@ class Config:
             raise ValueError("rate_tolerance 必须在0和0.1之间")
         if not math.isfinite(self.device_timestamp_lag_s):
             raise ValueError("device_timestamp_lag_s 必须有限")
+        for name in ("clock_slew_rate_s_per_s", "quality_clip_tolerance", "quality_jump_z"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f"{name} 必须非负且有限")
+        if not self.hard_gap_factor > self.max_gap_factor:
+            raise ValueError("hard_gap_factor 必须大于 max_gap_factor")
+        for name in ("max_warning_gaps", "max_warning_frame_anomalies", "max_warning_bad_channels"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} 必须为非负整数")
+        if not self.hard_rate_tolerance > self.rate_tolerance:
+            raise ValueError("hard_rate_tolerance 必须大于 rate_tolerance")
+        for name in ("quality_max_abs", "quality_rail_min", "quality_rail_max"):
+            value = getattr(self, name)
+            if value is not None and (not math.isfinite(value)):
+                raise ValueError(f"{name} 必须有限")
+        if self.quality_max_abs is not None and self.quality_max_abs <= 0:
+            raise ValueError("quality_max_abs 必须为正")
+        if ((self.quality_rail_min is None) != (self.quality_rail_max is None)
+                or (self.quality_rail_min is not None and self.quality_rail_min >= self.quality_rail_max)):
+            raise ValueError("quality_rail_min/max 必须同时设置且 min < max")
+        for name in ("rejection_min_score", "rejection_min_margin"):
+            value = getattr(self, name)
+            if value is not None and (not math.isfinite(value) or value < 0):
+                raise ValueError(f"{name} 必须非负且有限")
+        if self.rejection_enabled and self.rejection_min_score is None and self.rejection_min_margin is None:
+            raise ValueError("启用拒识时至少配置 rejection_min_score 或 rejection_min_margin")
         _validate_fs(self.target_fs)
         _normalise_channel_indices(self.channel_indices)
         if len(self.channel_indices) != len(self.channel_positions):
@@ -341,6 +383,9 @@ LAST_SESSION: Optional[dict[str, Any]] = None
 
 class InvalidTrial(RuntimeError):
     """数据/时序未通过质量检查；必须计入无效试次，而不是静默跳过。"""
+    def __init__(self, message: str, *, epoch: Optional["Epoch"] = None):
+        super().__init__(message)
+        self.epoch = epoch
 
 
 class DegenerateSignalError(ValueError):
@@ -426,6 +471,94 @@ def _normalised_rows(data: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if not len(active):
         raise DegenerateSignalError("全零或全部恒值通道，拒绝输出任意最高分类")
     return centered[active] / rms[active, None], active
+
+
+def assess_signal_quality(data: np.ndarray, *, unit: str = "UNKNOWN",
+                          max_abs: Optional[float] = None,
+                          rail_min: Optional[float] = None,
+                          rail_max: Optional[float] = None,
+                          clip_tolerance: float = 0.0,
+                          jump_z: float = 12.0,
+                          min_valid_channels: int = 6,
+                          max_warning_bad_channels: int = 2) -> dict[str, Any]:
+    """检查标准化前的原始 EEG，不改变 FBCCA 的输入和公式。
+
+    绝对幅值和削顶只有在设备单位/轨值明确时才有物理意义；未知单位只产生
+    警告，避免把任意 LSL 数值误当成微伏或伏特。返回的摘要可直接写入试次日志。
+    """
+    x = np.asarray(data, dtype=np.float64)
+    if x.ndim != 2 or min(x.shape, default=0) < 2:
+        raise InvalidTrial("原始EEG形状不足，无法进行质量检查")
+    report: dict[str, Any] = {
+        "unit": str(unit), "hard_fail": False, "hard_reasons": [], "warnings": [],
+        "valid_channels": [], "bad_channels": [], "max_abs": [], "peak_to_peak": [],
+        "clip_fraction": [], "jump_z": [],
+    }
+    if not np.isfinite(x).all():
+        report["hard_fail"] = True
+        report["hard_reasons"].append("EEG含NaN/Inf")
+        return report
+
+    centered = x - np.mean(x, axis=1, keepdims=True)
+    rms = np.sqrt(np.mean(centered * centered, axis=1))
+    scale = np.maximum(np.max(np.abs(x), axis=1), np.finfo(float).eps)
+    active = rms > 64 * np.finfo(float).eps * scale
+    report["valid_channels"] = np.flatnonzero(active).astype(int).tolist()
+    report["bad_channels"] = np.flatnonzero(~active).astype(int).tolist()
+    if len(report["bad_channels"]):
+        report["warnings"].append(
+            "恒值/无变化通道: " + ",".join(str(i + 1) for i in report["bad_channels"]))
+    if len(report["bad_channels"]) > max_warning_bad_channels or len(report["valid_channels"]) < min_valid_channels:
+        report["hard_fail"] = True
+        report["hard_reasons"].append(
+            f"有效通道仅{len(report['valid_channels'])}个，至少需要{min_valid_channels}个")
+
+    max_abs_values = np.max(np.abs(x), axis=1)
+    p2p_values = np.ptp(x, axis=1)
+    report["max_abs"] = max_abs_values.tolist()
+    report["peak_to_peak"] = p2p_values.tolist()
+    unit_known = str(unit).upper() not in ("AUTO", "UNKNOWN", "UNVERIFIED", "")
+    if max_abs is not None and unit_known:
+        if not np.isfinite(max_abs) or max_abs <= 0:
+            raise ValueError("max_abs 必须为有限正数")
+        too_large = np.flatnonzero(max_abs_values > max_abs)
+        if len(too_large):
+            report["hard_fail"] = True
+            report["hard_reasons"].append(
+                "幅值超过阈值的通道: " + ",".join(str(i + 1) for i in too_large))
+
+    clip_fraction = np.zeros(x.shape[0], dtype=float)
+    if not unit_known:
+        report["warnings"].append("单位未确认，绝对幅值/削顶仅记录未门控")
+    elif rail_min is not None or rail_max is not None:
+        if (rail_min is None or rail_max is None or not rail_min < rail_max
+                or not np.isfinite(rail_min) or not np.isfinite(rail_max)):
+            raise ValueError("rail_min/rail_max 必须同时为有限值且 min < max")
+        tol = max(0.0, float(clip_tolerance))
+        clipped = (x <= rail_min + tol) | (x >= rail_max - tol)
+        clip_fraction = clipped.mean(axis=1)
+        if np.any(clip_fraction > tol):
+            report["hard_fail"] = True
+            report["hard_reasons"].append(
+                "检测到设备轨值削顶通道: " + ",".join(
+                    str(i + 1) for i in np.flatnonzero(clip_fraction > tol)))
+    elif max_abs is None:
+        report["warnings"].append("单位或设备满量程阈值未配置，绝对幅值/削顶仅记录未门控")
+    report["clip_fraction"] = clip_fraction.tolist()
+
+    jump_values = np.zeros(x.shape[0], dtype=float)
+    for i, row in enumerate(x):
+        diff = np.diff(row)
+        med = float(np.median(diff))
+        mad = float(np.median(np.abs(diff - med)))
+        denom = max(1.4826 * mad, np.finfo(float).eps)
+        jump_values[i] = float(np.max(np.abs(diff - med)) / denom) if len(diff) else 0.0
+    report["jump_z"] = jump_values.tolist()
+    jump_channels = np.flatnonzero(jump_values > max(0.0, float(jump_z)))
+    if len(jump_channels):
+        report["warnings"].append(
+            "存在异常相邻跳变通道: " + ",".join(str(i + 1) for i in jump_channels))
+    return report
 
 
 def _inverse_sqrt_covariance(covariance: np.ndarray, regularization: float) -> np.ndarray:
@@ -576,6 +709,8 @@ class Epoch:
     local_timestamps: np.ndarray
     clock_corrections: np.ndarray
     diagnostics: dict[str, Any]
+    source_data: np.ndarray
+    uniform_timestamps: np.ndarray
 
 
 class TimestampBuffer:
@@ -597,16 +732,22 @@ class TimestampBuffer:
         self.last_raw = self.last_local = -math.inf
         self.lock = threading.Lock()
 
-    def append(self, samples: np.ndarray, raw_ts: np.ndarray, correction: float,
+    def append(self, samples: np.ndarray, raw_ts: np.ndarray, correction: Any,
                device_lag_s: float = 0.0) -> None:
         x, raw = np.asarray(samples, float), np.asarray(raw_ts, float)
         if raw.ndim != 1 or x.ndim != 2 or x.shape != (len(raw), self.n_channels):
             raise ValueError("EEG样本/时间戳维度不一致")
         if not len(raw):
             return
-        if not np.isfinite(raw).all() or not np.isfinite(correction) or not np.isfinite(device_lag_s):
+        corrections = np.asarray(correction, dtype=float)
+        if corrections.ndim == 0:
+            corrections = np.full(len(raw), float(corrections))
+        if corrections.shape != raw.shape:
+            raise ValueError("校正量必须是标量或与时间戳等长数组")
+        if (not np.isfinite(raw).all() or not np.isfinite(corrections).all()
+                or not np.isfinite(device_lag_s)):
             raise InvalidTrial("非有限时间戳/校正量")
-        local = raw + correction - device_lag_s
+        local = raw + corrections - device_lag_s
         with self.lock:
             # 将时间轴异常拆开诊断，便于区分“发布端原始时间戳问题”与
             # “接收端时间校正问题”。仍然保持严格原则：不排序、不静默丢弃。
@@ -632,24 +773,25 @@ class TimestampBuffer:
                     "校正后单个chunk内部时间戳非递增："
                     f"index={bad}->{bad + 1}, previous={local[bad]:.9f}, "
                     f"current={local[bad + 1]:.9f}, delta={local_diff[bad]:.9f}s, "
-                    f"fixed_correction={correction:.9f}s"
+                    f"fixed_correction={corrections[bad]:.9f}s"
                 )
             if local[0] <= self.last_local:
                 raise InvalidTrial(
                     "校正后跨chunk时间轴回退/重复："
                     f"previous_last={self.last_local:.9f}, current_first={local[0]:.9f}, "
                     f"delta={local[0] - self.last_local:.9f}s, "
-                    f"fixed_correction={correction:.9f}s"
+                    f"fixed_correction={corrections[0]:.9f}s"
                 )
 
             self.last_raw, self.last_local = float(raw[-1]), float(local[-1])
             self.total_received += len(raw)
             if len(raw) >= self.capacity:
-                x, raw, local = x[-self.capacity:], raw[-self.capacity:], local[-self.capacity:]
+                x, raw, local, corrections = (v[-self.capacity:] for v in
+                                               (x, raw, local, corrections))
             n = len(raw)
             indices = (self.cursor + np.arange(n)) % self.capacity
             self.samples[indices], self.raw_ts[indices], self.local_ts[indices] = x, raw, local
-            self.corrections[indices] = correction
+            self.corrections[indices] = corrections
             self.valid[indices] = np.isfinite(x).all(axis=1)
             self.cursor = (self.cursor + n) % self.capacity
             self.size = min(self.capacity, self.size + n)
@@ -666,7 +808,9 @@ class TimestampBuffer:
                     self.local_ts[indices].copy(), self.corrections[indices].copy(), self.valid[indices].copy())
 
     def epoch(self, start: float, duration_s: float, nominal_fs: float,
-              max_gap_factor: float = 1.5, rate_tolerance: float = .02) -> Epoch:
+              max_gap_factor: float = 1.5, rate_tolerance: float = .02,
+              hard_gap_factor: float = 2.0, hard_rate_tolerance: float = .05,
+              max_warning_gaps: int = 1) -> Epoch:
         _validate_fs(nominal_fs)
         if not np.isfinite(start) or not np.isfinite(duration_s) or duration_s <= 0:
             raise ValueError("事件时间/窗口长度不合法")
@@ -678,22 +822,46 @@ class TimestampBuffer:
         left = int(np.searchsorted(local, start, side="right") - 1)
         right = int(np.searchsorted(local, end, side="left"))
         x, raw, local, corrections, valid = (v[left:right + 1] for v in (x, raw, local, corrections, valid))
+        def failure_epoch(message: str) -> Epoch:
+            return Epoch(
+                np.empty((x.shape[0], 0), dtype=float), nominal_fs, start, end,
+                raw.copy(), local.copy(), corrections.copy(), {"hard_reason": message},
+                x.copy(), np.empty(0, dtype=float))
         if len(local) < 3 or not np.all(valid):
-            raise InvalidTrial("窗口含NaN/Inf或有效样本不足")
+            message = "窗口含NaN/Inf或有效样本不足"
+            raise InvalidTrial(message, epoch=failure_epoch(message))
         dt_raw, dt_local = np.diff(raw), np.diff(local)
         nominal_dt = 1 / nominal_fs
         if np.any(dt_raw <= 0) or np.any(dt_local <= 0):
-            raise InvalidTrial("窗口时间戳不严格递增")
-        if max(float(dt_raw.max()), float(dt_local.max())) > nominal_dt * max_gap_factor:
-            raise InvalidTrial("窗口存在缺样/过大时间戳抖动；拒绝跨缺口插值")
+            message = "窗口时间戳不严格递增"
+            raise InvalidTrial(message, epoch=failure_epoch(message))
+        interval = np.maximum(dt_raw, dt_local)
+        gap_mask = interval > nominal_dt * max_gap_factor
+        hard_gap_mask = interval >= nominal_dt * hard_gap_factor
+        warnings: list[str] = []
+        if np.any(hard_gap_mask) or int(np.count_nonzero(gap_mask)) > max_warning_gaps:
+            message = ("窗口存在连续缺样/过大时间戳间隔："
+                       f"warning_gaps={int(np.count_nonzero(gap_mask))}, "
+                       f"hard_gaps={int(np.count_nonzero(hard_gap_mask))}")
+            raise InvalidTrial(message, epoch=failure_epoch(message))
+        if np.any(gap_mask):
+            warnings.append(f"存在{int(np.count_nonzero(gap_mask))}个轻微异常采样间隔")
         measured_fs = (len(local) - 1) / (local[-1] - local[0])
         raw_measured_fs = (len(raw) - 1) / (raw[-1] - raw[0])
-        if abs(measured_fs / nominal_fs - 1) > rate_tolerance:
-            raise InvalidTrial(f"时间戳估计采样率{measured_fs:.3f}与声明{nominal_fs:g} Hz不符")
+        local_rate_error = abs(measured_fs / nominal_fs - 1)
+        raw_rate_error = abs(raw_measured_fs / nominal_fs - 1)
+        if max(local_rate_error, raw_rate_error) > hard_rate_tolerance:
+            message = (f"原始/校正时间戳采样率偏差过大：raw={raw_measured_fs:.3f}Hz, "
+                       f"local={measured_fs:.3f}Hz, declared={nominal_fs:g}Hz")
+            raise InvalidTrial(message, epoch=failure_epoch(message))
+        if max(local_rate_error, raw_rate_error) > rate_tolerance:
+            warnings.append(
+                f"时间戳采样率轻微偏差：raw={raw_measured_fs:.3f}Hz, local={measured_fs:.3f}Hz")
         _validate_fs(min(measured_fs, raw_measured_fs))
         grid = start + np.arange(sample_count(duration_s, nominal_fs)) / nominal_fs
         if grid.size < 32 or grid[-1] > local[-1] or grid[0] < local[0]:
-            raise InvalidTrial("窗口不满足重采样时间覆盖")
+            message = "窗口不满足重采样时间覆盖"
+            raise InvalidTrial(message, epoch=failure_epoch(message))
         # 仅在已验证无明确缺样后，把轻微时间抖动对齐到统一时间网格。
         # 保留高原始采样率后交给resample_poly抗混叠降采样，不能直接插值到250 Hz。
         uniform = np.vstack([np.interp(grid, local, channel) for channel in x.T])
@@ -704,8 +872,10 @@ class TimestampBuffer:
             "source_support_start": float(local[0]), "source_support_end": float(local[-1]),
             "uniform_last_sample": float(grid[-1]), "end_is_exclusive": True,
             "clock_correction_min_s": float(corrections.min()), "clock_correction_max_s": float(corrections.max()),
-            "interpolation": "timestamp-grid alignment only; gaps rejected; no extrapolation",
-        })
+            "interpolation": "timestamp-grid alignment only; gaps validated; no extrapolation",
+            "warnings": warnings,
+            "warning_gap_count": int(np.count_nonzero(gap_mask)),
+        }, x.copy(), grid.copy())
 
 
 def _parse_stream_metadata(info: Any, indices: Sequence[int]) -> dict:
@@ -733,6 +903,50 @@ def _parse_stream_metadata(info: Any, indices: Sequence[int]) -> dict:
             "raw_xml": xml}
 
 
+@dataclass
+class ClockCorrectionState:
+    """将新的 LSL 校正值平滑应用到后续原始样本，不回写历史时间轴。"""
+    observed: float
+    target: float
+    applied: float
+    slew_rate_s_per_s: float
+    last_raw: Optional[float] = None
+
+    def observe(self, value: float, max_step_s: float) -> None:
+        value = float(value)
+        if not np.isfinite(value):
+            raise InvalidTrial("LSL time_correction 返回非有限值")
+        step = value - self.observed
+        if abs(step) > max_step_s:
+            raise InvalidTrial(
+                "LSL时钟校正突变超过阈值，停止以避免错配试次："
+                f"previous={self.observed:.9f}s, current={value:.9f}s, "
+                f"step={step:.9f}s, limit={max_step_s:.9f}s")
+        self.observed = value
+        self.target = value
+
+    def apply(self, raw_timestamps: np.ndarray) -> np.ndarray:
+        raw = np.asarray(raw_timestamps, dtype=float)
+        if raw.ndim != 1 or not len(raw) or not np.isfinite(raw).all():
+            raise InvalidTrial("原始时间戳非有限或为空")
+        if np.any(np.diff(raw) <= 0) or (self.last_raw is not None and raw[0] <= self.last_raw):
+            raise InvalidTrial("原始时间戳倒序/重复，拒绝构造校正时间轴")
+        current = float(self.applied)
+        previous = self.last_raw
+        applied = np.empty(len(raw), dtype=float)
+        for i, timestamp in enumerate(raw):
+            dt = 1.0 / 250.0 if previous is None else float(timestamp - previous)
+            if dt <= 0 or not np.isfinite(dt):
+                raise InvalidTrial("原始时间戳间隔非法")
+            max_change = max(0.0, float(self.slew_rate_s_per_s)) * dt
+            current += float(np.clip(self.target - current, -max_change, max_change))
+            applied[i] = current
+            previous = float(timestamp)
+        self.applied = current
+        self.last_raw = float(raw[-1])
+        return applied
+
+
 class ContinuousLSL:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -744,7 +958,7 @@ class ContinuousLSL:
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self.clock: Callable[[], float] = time.monotonic
-        self.clock_updates: list[tuple[float, float]] = []
+        self.clock_updates: list[dict[str, float]] = []
         self.estimated_fs = math.nan
 
     def start(self) -> None:
@@ -790,7 +1004,8 @@ class ContinuousLSL:
             self.metadata = _parse_stream_metadata(info, self.cfg.channel_indices)
             self.inlet.open_stream(timeout=self.cfg.connect_timeout_s)
             correction = float(self.inlet.time_correction(timeout=self.cfg.connect_timeout_s))
-            self.clock_updates.append((self.clock(), correction))
+            self.clock_updates.append({"local_time": self.clock(), "observed": correction,
+                                       "target": correction, "applied": correction})
             self.buffer = TimestampBuffer(math.ceil(self.cfg.buffer_s * self.fs * 1.05), len(self.cfg.channel_indices))
             self.thread = threading.Thread(target=self._run, args=(correction,), name="EEG-LSL-collector", daemon=True)
             self.thread.start()
@@ -800,11 +1015,19 @@ class ContinuousLSL:
         deadline = time.monotonic() + self.cfg.startup_timeout_s
         while time.monotonic() < deadline:
             self.check_health()
-            _, _, local, _, _ = self.buffer.snapshot()
+            _, raw, local, _, _ = self.buffer.snapshot()
             if len(local) > 2 and local[-1] - local[0] >= self.cfg.warmup_s:
                 self.estimated_fs = (len(local) - 1) / (local[-1] - local[0])
-                if abs(self.estimated_fs / self.fs - 1) > self.cfg.rate_tolerance:
-                    raise RuntimeError(f"启动实测时间戳速率{self.estimated_fs:.3f}与声明{self.fs:g} Hz不符")
+                raw_estimated_fs = (len(raw) - 1) / (raw[-1] - raw[0])
+                startup_error = abs(self.estimated_fs / self.fs - 1)
+                raw_startup_error = abs(raw_estimated_fs / self.fs - 1)
+                if max(startup_error, raw_startup_error) > self.cfg.hard_rate_tolerance:
+                    raise RuntimeError(
+                        f"启动实测时间戳速率不符：raw={raw_estimated_fs:.3f}Hz, "
+                        f"local={self.estimated_fs:.3f}Hz, declared={self.fs:g}Hz")
+                if max(startup_error, raw_startup_error) > self.cfg.rate_tolerance:
+                    print(f"[时间轴警告] 启动实测采样率raw={raw_estimated_fs:.3f}Hz, "
+                          f"local={self.estimated_fs:.3f}Hz，与声明值轻微偏差。", flush=True)
                 _validate_fs(self.estimated_fs)
                 return
             self.stop_event.wait(.02)
@@ -812,51 +1035,23 @@ class ContinuousLSL:
 
     def _run(self, correction: float) -> None:
         assert self.inlet is not None and self.buffer is not None
-
-        # 快速调试模式：优先保证 OpenBCI -> LSL -> 程序链路可以进入界面。
-        # OpenBCI GUI 的 LSL 原始 timestamp 偶尔会在单个 chunk 内轻微回退。
-        # 在 quick_entry_mode 下不再因此终止，而是保持 EEG 样本原有顺序，按
-        # LSL 声明的 nominal sampling rate 构造连续时间轴。
-        # 这不是最终实验级时间同步方案，仅用于当前联调/进入程序。
-        timestamp_correction = float(correction)
-        observed_correction = float(correction)
-        synthetic_next_raw: Optional[float] = None
-        warned_timestamp_rebuild = False
-        warned_clock = False
-        warned_age = False
+        correction_state = ClockCorrectionState(
+            observed=float(correction), target=float(correction), applied=float(correction),
+            slew_rate_s_per_s=self.cfg.clock_slew_rate_s_per_s)
 
         next_clock_update = time.monotonic() + self.cfg.clock_refresh_s
         last_arrival = time.monotonic()
         try:
             while not self.stop_event.is_set():
                 if time.monotonic() >= next_clock_update:
-                    if self.cfg.quick_entry_mode:
-                        # 仅观测，不让时钟微调阻止进入程序。
-                        try:
-                            if hasattr(self.inlet, "was_clock_reset") and self.inlet.was_clock_reset():
-                                if not warned_clock:
-                                    print("[快速模式警告] LSL报告源时钟重置；当前联调继续运行。", flush=True)
-                                    warned_clock = True
-                            new_correction = float(self.inlet.time_correction(timeout=.1))
-                            self.clock_updates.append((self.clock(), new_correction))
-                            observed_correction = new_correction
-                        except Exception as exc:
-                            if not warned_clock:
-                                print(f"[快速模式警告] time_correction监控失败，当前联调继续：{exc}", flush=True)
-                                warned_clock = True
-                    else:
-                        if hasattr(self.inlet, "was_clock_reset") and self.inlet.was_clock_reset():
-                            raise InvalidTrial("LSL源时钟已重置，必须重新建立实验同步")
-                        new_correction = float(self.inlet.time_correction(timeout=.1))
-                        correction_step = new_correction - observed_correction
-                        if abs(correction_step) > self.cfg.max_clock_step_s:
-                            raise InvalidTrial(
-                                "LSL时钟校正突变超过阈值，停止以避免错配试次："
-                                f"previous={observed_correction:.9f}s, current={new_correction:.9f}s, "
-                                f"step={correction_step:.9f}s, limit={self.cfg.max_clock_step_s:.9f}s"
-                            )
-                        observed_correction = new_correction
-                        self.clock_updates.append((self.clock(), observed_correction))
+                    if hasattr(self.inlet, "was_clock_reset") and self.inlet.was_clock_reset():
+                        raise InvalidTrial("LSL源时钟已重置，必须重新建立实验同步")
+                    new_correction = float(self.inlet.time_correction(timeout=.1))
+                    correction_state.observe(new_correction, self.cfg.max_clock_step_s)
+                    self.clock_updates.append({
+                        "local_time": self.clock(), "observed": correction_state.observed,
+                        "target": correction_state.target, "applied": correction_state.applied,
+                    })
                     next_clock_update = time.monotonic() + self.cfg.clock_refresh_s
 
                 samples, ts = self.inlet.pull_chunk(
@@ -873,53 +1068,18 @@ class ContinuousLSL:
                     raise InvalidTrial("EEG流通道数或形状发生变化")
 
                 incoming_ts = np.asarray(ts, dtype=float)
-                if self.cfg.quick_entry_mode:
-                    if not np.isfinite(incoming_ts).all():
-                        # 第一个锚点都不可用时，以接收端LSL时钟反推源时钟域。
-                        anchor = self.clock() - timestamp_correction
-                    elif synthetic_next_raw is None:
-                        anchor = float(incoming_ts[0])
-                    else:
-                        anchor = float(synthetic_next_raw)
-
-                    # 始终按样本顺序构造连续时间轴；不排序、不删除EEG样本。
-                    repaired_ts = anchor + np.arange(len(incoming_ts), dtype=float) / self.fs
-                    synthetic_next_raw = float(repaired_ts[-1] + 1.0 / self.fs)
-
-                    # 仅第一次发现发布端原始timestamp异常时打印提示。
-                    if len(incoming_ts) > 1:
-                        bad = np.any(np.diff(incoming_ts) <= 0)
-                    else:
-                        bad = False
-                    if bad and not warned_timestamp_rebuild:
-                        print(
-                            "[快速模式] 检测到OpenBCI/LSL原始timestamp逆序；"
-                            "当前按nominal sampling rate重建连续时间轴以优先进入程序。",
-                            flush=True,
-                        )
-                        warned_timestamp_rebuild = True
-                    used_ts = repaired_ts
-                else:
-                    used_ts = incoming_ts
+                applied_corrections = correction_state.apply(incoming_ts)
 
                 self.buffer.append(
-                    x[:, self.cfg.channel_indices], used_ts, timestamp_correction,
+                    x[:, self.cfg.channel_indices], incoming_ts, applied_corrections,
                     self.cfg.device_timestamp_lag_s
                 )
 
                 age = self.clock() - self.buffer.latest
                 if age > self.cfg.max_receive_age_s or age < -.1:
-                    if self.cfg.quick_entry_mode:
-                        if not warned_age:
-                            print(
-                                f"[快速模式警告] EEG时间轴与本地LSL时钟差{age:.3f}s；"
-                                "当前联调不终止。", flush=True
-                            )
-                            warned_age = True
-                    else:
-                        raise InvalidTrial(
-                            f"EEG时间轴不在合理本地LSL范围，样本年龄{age:.3f}s；检查发布端时间戳"
-                        )
+                    raise InvalidTrial(
+                        f"EEG时间轴不在合理本地LSL范围，样本年龄{age:.3f}s；检查发布端时间戳"
+                    )
         except BaseException as exc:
             self.error = exc
             self.stop_event.set()
@@ -943,7 +1103,10 @@ class ContinuousLSL:
                 raise InvalidTrial(f"EEG未覆盖窗口终点{end:.6f}，该试次不分类")
             cancel.wait(.01)
         self.check_health()
-        return self.buffer.epoch(start, self.cfg.window_s, self.fs, self.cfg.max_gap_factor, self.cfg.rate_tolerance)
+        return self.buffer.epoch(
+            start, self.cfg.window_s, self.fs, self.cfg.max_gap_factor,
+            self.cfg.rate_tolerance, self.cfg.hard_gap_factor,
+            self.cfg.hard_rate_tolerance, self.cfg.max_warning_gaps)
 
     def close(self) -> None:
         self.stop_event.set()
@@ -961,6 +1124,22 @@ def decode_trial(trial_id: int, onset: float, collector: ContinuousLSL, cfg: Con
     epoch = collector.wait_epoch(onset, cancel)
     if cancel.is_set():
         raise AbortSession("已取消分类")
+    if cfg.input_unit == "AUTO":
+        units = [str(item.get("unit", "UNKNOWN")) for item in
+                 collector.metadata.get("selected_channels", [])]
+        quality_unit = units[0] if units and len(set(units)) == 1 else "UNKNOWN"
+    else:
+        quality_unit = cfg.input_unit
+    quality = assess_signal_quality(
+        epoch.source_data, unit=quality_unit, max_abs=cfg.quality_max_abs,
+        rail_min=cfg.quality_rail_min, rail_max=cfg.quality_rail_max,
+        clip_tolerance=cfg.quality_clip_tolerance, jump_z=cfg.quality_jump_z,
+        min_valid_channels=cfg.min_valid_channels,
+        max_warning_bad_channels=cfg.max_warning_bad_channels)
+    epoch.diagnostics["quality"] = quality
+    epoch.diagnostics.setdefault("warnings", []).extend(quality["warnings"])
+    if quality["hard_fail"]:
+        raise InvalidTrial("EEG信号质量不合格：" + "; ".join(quality["hard_reasons"]), epoch=epoch)
     started = time.monotonic()
     from threadpoolctl import threadpool_limits
     with threadpool_limits(limits=1):
@@ -968,7 +1147,8 @@ def decode_trial(trial_id: int, onset: float, collector: ContinuousLSL, cfg: Con
             target_frequencies_hz=BENCHMARK_FREQUENCIES_HZ, n_harmonics=cfg.n_harmonics,
             target_fs=cfg.target_fs, notch_hz=cfg.notch_hz, a=cfg.weight_a, b=cfg.weight_b,
             regularization=cfg.cca_regularization, min_valid_channels=cfg.min_valid_channels)
-    result.update(trial_id=trial_id, epoch=epoch, computation_s=time.monotonic() - started)
+    result.update(trial_id=trial_id, epoch=epoch, quality=quality,
+                  computation_s=time.monotonic() - started)
     return result
 
 
@@ -1060,6 +1240,7 @@ class TrialRecord:
     requested_window_start: Optional[float] = None
     requested_window_end: Optional[float] = None
     actual_stimulus_s: Optional[float] = None
+    artifact_refs: dict[str, str] = field(default_factory=dict)
 
 
 class TrialLedger:
@@ -1083,7 +1264,7 @@ class TrialLedger:
     def commit(self, record: TrialRecord) -> None:
         if record.trial_id in self.ids:
             raise RuntimeError(f"试次{record.trial_id}重复提交")
-        if record.status not in ("valid", "invalid", "aborted"):
+        if record.status not in ("valid", "rejected", "invalid", "aborted"):
             raise RuntimeError("未结束的试次不能提交")
         if record.mode == "free":
             if record.true_class is not None:
@@ -1100,14 +1281,163 @@ class TrialLedger:
             if not 1 <= pred <= len(TARGETS) or not 1 <= record.result["cca_prediction"] <= len(TARGETS):
                 raise ValueError("分类结果超出范围")
             if not record.text_applied:
-                self.apply_prediction(pred)
-                record.text_applied = True
+                raise RuntimeError("有效试次必须先显式写入字符，再提交")
+        elif record.text_applied:
+            raise RuntimeError("拒识/无效/中止试次不得写入字符")
         self.ids.add(record.trial_id)
         self.records.append(record)
 
 
+def _json_safe(value: Any) -> Any:
+    """将试次元数据转换为不依赖 pickle 的 JSON 值。"""
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return value
+    if isinstance(value, (np.integer, np.floating)):
+        return _json_safe(value.item())
+    if isinstance(value, np.ndarray):
+        return [_json_safe(item) for item in value.tolist()]
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if hasattr(value, "__dict__"):
+        return _json_safe(vars(value))
+    return str(value)
+
+
+class SessionRecorder:
+    """逐试次原子保存 JSON 元数据和 NPZ 数组，避免自由输入退出时丢失 EEG。"""
+    schema_version = 1
+
+    def __init__(self, cfg: Config, *, root: Optional[str | Path] = None,
+                 context: Optional[dict[str, Any]] = None):
+        base = Path(root if root is not None else cfg.record_root)
+        if not base.is_absolute():
+            base = Path(__file__).resolve().parent / base
+        timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        self.session_dir = base / f"session_{timestamp}_{uuid.uuid4().hex[:8]}"
+        self.session_dir.mkdir(parents=True, exist_ok=False)
+        self.manifest_path = self.session_dir / "manifest.json"
+        self.session_path = self.session_dir / "session.json"
+        self.cfg = cfg
+        self.manifest: dict[str, Any] = {
+            "schema_version": self.schema_version,
+            "session_dir": str(self.session_dir),
+            "created_utc": timestamp,
+            "context": _json_safe(context or {}),
+            "trials": [],
+        }
+        self._atomic_json(self.manifest_path, self.manifest)
+
+    @staticmethod
+    def _atomic_json(path: Path, payload: Any) -> None:
+        temp = path.with_name(path.name + f".tmp-{uuid.uuid4().hex}")
+        with temp.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(_json_safe(payload), handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+
+    @staticmethod
+    def _atomic_npz(path: Path, arrays: dict[str, np.ndarray]) -> None:
+        temp = path.with_name(path.name + f".tmp-{uuid.uuid4().hex}")
+        with temp.open("wb") as handle:
+            np.savez_compressed(handle, **arrays)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+
+    def write_trial(self, record: TrialRecord) -> dict[str, str]:
+        trial_stem = f"trial_{record.trial_id:04d}"
+        metadata_path = self.session_dir / f"{trial_stem}.json"
+        arrays_path = self.session_dir / f"{trial_stem}.npz"
+        record.artifact_refs = {"metadata": str(metadata_path), "arrays": str(arrays_path)}
+        result = record.result or {}
+        epoch = result.get("epoch")
+        arrays: dict[str, np.ndarray] = {
+            "frame_flip_times": np.asarray(record.frame_flip_times, dtype=float),
+        }
+        frame_intervals = record.frame_diagnostics.get("psychopy_frame_intervals_s")
+        if frame_intervals is not None:
+            arrays["psychopy_frame_intervals_s"] = np.asarray(frame_intervals, dtype=float)
+        if epoch is not None:
+            arrays.update({
+                "source_data": np.asarray(epoch.source_data, dtype=float),
+                "source_raw_timestamps": np.asarray(epoch.raw_timestamps, dtype=float),
+                "source_local_timestamps": np.asarray(epoch.local_timestamps, dtype=float),
+                "clock_corrections": np.asarray(epoch.clock_corrections, dtype=float),
+                "uniform_data": np.asarray(epoch.data, dtype=float),
+                "uniform_timestamps": np.asarray(epoch.uniform_timestamps, dtype=float),
+            })
+        for key in ("scores", "correlations", "weights", "cca_scores"):
+            if key in result:
+                arrays[key] = np.asarray(result[key], dtype=float)
+        self._atomic_npz(arrays_path, arrays)
+        frame_diag = dict(record.frame_diagnostics)
+        frame_diag.pop("intervals_s", None)
+        trial_metadata = {
+            "schema_version": self.schema_version,
+            "trial_id": record.trial_id, "block_id": record.block_id,
+            "mode": record.mode, "true_class": record.true_class,
+            "true_symbol": (TARGETS[record.true_class - 1].symbol
+                             if record.true_class is not None else None),
+            "true_frequency_hz": (TARGETS[record.true_class - 1].frequency_hz
+                                   if record.true_class is not None else None),
+            "status": record.status, "reason": record.reason,
+            "text_applied": record.text_applied,
+            "start": record.start, "end": record.end,
+            "duration_s": max(0.0, record.end - record.start),
+            "cue_onset": record.cue_onset, "stimulus_onset": record.stimulus_onset,
+            "stimulus_offset": record.stimulus_offset,
+            "requested_window_start": record.requested_window_start,
+            "requested_window_end": record.requested_window_end,
+            "actual_stimulus_s": record.actual_stimulus_s,
+            "phase_times": record.phase_times,
+            "frame_diagnostics": frame_diag,
+            "prediction": result.get("prediction"),
+            "frequency_hz": result.get("frequency_hz"),
+            "scores": result.get("scores"),
+            "cca_prediction": result.get("cca_prediction"),
+            "cca_frequency_hz": result.get("cca_frequency_hz"),
+            "cca_scores": result.get("cca_scores"),
+            "correlations": result.get("correlations"),
+            "computation_s": result.get("computation_s"),
+            "quality": result.get("quality"),
+            "epoch_diagnostics": epoch.diagnostics if epoch is not None else None,
+            "artifact_refs": record.artifact_refs,
+            "arrays_file": arrays_path.name,
+        }
+        self._atomic_json(metadata_path, trial_metadata)
+        entry = {"trial_id": record.trial_id, "status": record.status,
+                 "metadata_file": metadata_path.name, "arrays_file": arrays_path.name}
+        self.manifest["trials"].append(entry)
+        self._atomic_json(self.manifest_path, self.manifest)
+        return dict(record.artifact_refs)
+
+    def finalize(self, *, summary: dict[str, Any], events: Sequence[EventStamp],
+                 acquisition_metadata: dict[str, Any], acquisition_review: dict[str, Any],
+                 clock_updates: Sequence[Any], display_info: dict[str, Any],
+                 typed_text: str, stop_reason: str) -> str:
+        payload = {
+            "schema_version": self.schema_version,
+            "manifest_file": self.manifest_path.name,
+            "config": vars(self.cfg), "summary": summary,
+            "events": events, "acquisition_metadata": acquisition_metadata,
+            "acquisition_review": acquisition_review, "clock_updates": clock_updates,
+            "display_info": display_info, "typed_text": typed_text,
+            "stop_reason": stop_reason,
+        }
+        self._atomic_json(self.session_path, payload)
+        self.manifest["session_file"] = self.session_path.name
+        self._atomic_json(self.manifest_path, self.manifest)
+        return str(self.session_path)
+
+
 def frame_diagnostics(flip_times: Sequence[float], refresh_hz: float,
-                      long_factor: float = 1.5, short_factor: float = .5) -> dict:
+                      long_factor: float = 1.5, short_factor: float = .5,
+                      max_warning_anomalies: int = 1) -> dict:
     ts = np.asarray(flip_times, float)
     if ts.ndim != 1 or len(ts) < 2 or not np.isfinite(ts).all() or refresh_hz <= 0:
         raise InvalidTrial("刺激帧时间记录不足或非法")
@@ -1116,11 +1446,17 @@ def frame_diagnostics(flip_times: Sequence[float], refresh_hz: float,
     long = intervals > long_factor * period
     short = intervals < short_factor * period
     missed = np.maximum(1, np.rint(intervals[long] / period).astype(int) - 1).sum() if np.any(long) else 0
+    anomaly_count = int(long.sum() + short.sum())
     return {"intervals_s": intervals, "long_intervals": int(long.sum()), "short_intervals": int(short.sum()),
             "estimated_missed_frames": int(missed), "min_interval_ms": float(intervals.min() * 1000),
             "median_interval_ms": float(np.median(intervals) * 1000),
             "max_interval_ms": float(intervals.max() * 1000),
-            "valid": not bool(np.any(long | short)), "refresh_hz": refresh_hz}
+            "anomaly_count": anomaly_count,
+            "valid": anomaly_count <= max_warning_anomalies,
+            "strict_valid": anomaly_count == 0,
+            "warning": 0 < anomaly_count <= max_warning_anomalies,
+            "hard_invalid": anomaly_count > max_warning_anomalies,
+            "refresh_hz": refresh_hz}
 
 
 def make_schedule(blocks: int, seed: int) -> list[tuple[int, int]]:
@@ -1176,7 +1512,8 @@ def summarize_trials(records: Sequence[TrialRecord], planned: int) -> dict:
     active_s = sum(max(0.0, r.end - r.start) for r in records)
     wall_s = max((r.end for r in records), default=0) - min((r.start for r in records), default=0)
     report = {"planned": planned, "attempted": attempted, "not_started": max(0, planned - attempted),
-        "valid": len(valid), "invalid_or_aborted": attempted - len(valid),
+        "valid": len(valid), "rejected": sum(r.status == "rejected" for r in records),
+        "invalid_or_aborted": sum(r.status in ("invalid", "aborted") for r in records),
         "active_selection_s": active_s, "wall_s_including_breaks": max(0, wall_s),
         "mean_actual_selection_s": active_s / attempted if attempted else None,
         "target_attempts": counts, "target_valid": valid_counts, "target_invalid": invalid_counts,
@@ -1202,9 +1539,9 @@ def print_summary(report: dict, ledger: TrialLedger) -> None:
         print("尚未开始试次，请先处理上方的结束原因。", flush=True)
         return
     print("\n" + "=" * 76)
-    print("提示式40分类结果（非自由输入；不保存文件）")
+    print("提示式40分类结果（非自由输入；JSON/NPZ记录已保存）")
     print(f"计划{report['planned']}次 | 已开始{report['attempted']} | 有效{report['valid']} | "
-          f"无效/中止{report['invalid_or_aborted']} | 未开始{report['not_started']}")
+          f"拒识{report.get('rejected', 0)} | 无效/中止{report['invalid_or_aborted']} | 未开始{report['not_started']}")
     mean_time = report['mean_actual_selection_s']
     if mean_time is not None:
         print(f"实际每次选择平均{mean_time:.3f}s，包含提示、刺激、等待、计算、空白和反馈。")
@@ -1232,10 +1569,10 @@ def print_summary(report: dict, ledger: TrialLedger) -> None:
         print("; ".join(f"{i+1:02d}->{j+1:02d}: {count}" for i, j, count in errors) or "没有已记录的有效试次错分。")
     invalid = [r for r in ledger.records if r.status != "valid"]
     for r in invalid:
-        print(f"无效/中止 trial={r.trial_id} true={r.true_class:02d}: {r.reason}")
-    print(f"\n键盘输出（仅本程序内存）：{ledger.typed_text!r}")
-    print("完整40x40混淆矩阵、逐帧时间、事件、每窗EEG/时间戳和分数均在 LAST_SESSION 内存对象中。")
-    print("这些结果不能证明屏幕物理同步、设备延迟、眼动或伪迹已验证；进程退出后数据不保留。")
+        true_label = "--" if r.true_class is None else f"{r.true_class:02d}"
+        print(f"无效/拒识/中止 trial={r.trial_id} true={true_label}: {r.reason}")
+    print(f"\n键盘输出：{ledger.typed_text!r}")
+    print("完整混淆矩阵、逐帧时间、事件、每窗EEG/时间戳和分数已写入会话记录目录。")
 
 
 def summarize_free_trials(records: Sequence[TrialRecord], ledger: TrialLedger) -> dict:
@@ -1246,7 +1583,8 @@ def summarize_free_trials(records: Sequence[TrialRecord], ledger: TrialLedger) -
         "mode": "free", "attempted": len(records),
         "valid": sum(r.status == "valid" for r in records),
         "input_actions": sum(r.text_applied for r in records),
-        "invalid_or_aborted": sum(r.status != "valid" for r in records),
+        "rejected": sum(r.status == "rejected" for r in records),
+        "invalid_or_aborted": sum(r.status in ("invalid", "aborted") for r in records),
         "typed_text": ledger.typed_text,
         "ground_truth_available": False, "accuracy": None, "itr_bits_per_minute": None,
     }
@@ -1256,10 +1594,11 @@ def print_free_summary(report: dict) -> None:
     print("\n" + "=" * 76)
     print("自由输入结束（真实LSL EEG；无预设目标；文本仅在本程序中）")
     print(f"已开始{report['attempted']}轮 | 已执行{report['input_actions']}次输入操作"
-          f"（包括SPACE/BACK） | 无效或未完成{report['invalid_or_aborted']}轮")
+          f"（包括SPACE/BACK） | 拒识{report.get('rejected', 0)}轮 | "
+          f"无效或未完成{report['invalid_or_aborted']}轮")
     print("最终文本：", repr(report['typed_text']))
     print("自由输入没有真实目标标签，不计算准确率、混淆矩阵或ITR。")
-    print("当前快速模式未校准个人模型，也不具备自动空闲检测。离开注视前请先暂停。")
+    print("自由输入未校准个人模型，也不具备自动空闲检测。离开注视前请先暂停。")
 
 
 def output_display_text(text: str, max_chars: int) -> str:
@@ -1306,7 +1645,9 @@ def preflight_review(cfg: Config, collector: ContinuousLSL) -> dict:
         print(f"分析通道{j+1}: {position:3s} <- LSL[{channel['lsl_index']}] "
               f"(假定设备CH{channel['lsl_index']+1}); 流标签={channel['label']!r}, 单位={channel['unit']!r}")
     print("发布端过滤元数据：", "; ".join(meta['publisher_filter_metadata']))
-    print("软件校时：raw EEG timestamp + inlet.time_correction() - 已校准设备滞后(默认未应用)。")
+    print("软件校时：原始 EEG timestamp + 平滑应用的 time_correction - 已校准设备滞后(默认未应用)。")
+    print(f"信号质量门控：至少{cfg.min_valid_channels}/{len(cfg.channel_indices)}通道有效；"
+          f"幅值阈值={cfg.quality_max_abs}; 设备轨值={cfg.quality_rail_min}/{cfg.quality_rail_max}。")
     print("未知单位/滤波不会被猜测为已确认。已知上游低通<90Hz时拒绝完整M3。")
     choices = list(dict.fromkeys([cfg.input_unit, "AUTO", "uV", "V", "mV", "UNKNOWN"]))
     fields = {
@@ -1381,9 +1722,11 @@ def calculate_keyboard_layout(cfg: Config, window_size: Sequence[float]
 
 
 class PsychoPyKeyboard:
-    def __init__(self, cfg: Config, collector: ContinuousLSL, markers: EventMarkers, ledger: TrialLedger):
+    def __init__(self, cfg: Config, collector: ContinuousLSL, markers: EventMarkers,
+                 ledger: TrialLedger, recorder: Optional[SessionRecorder] = None):
         from psychopy import visual, event, logging
         self.cfg, self.collector, self.markers, self.ledger = cfg, collector, markers, ledger
+        self.recorder = recorder
         self.visual, self.event = visual, event
         self.clock = collector.clock
         self.cancel = threading.Event()
@@ -1459,11 +1802,7 @@ class PsychoPyKeyboard:
             self.win.flip()
         refresh = self.win.getActualFrameRate(nIdentical=30, nMaxFrames=180, nWarmUpFrames=30, threshold=.5)
         if refresh is None or not np.isfinite(refresh) or refresh <= 2 * BENCHMARK_FREQUENCIES_HZ.max():
-            if cfg.quick_entry_mode:
-                refresh = 60.0
-                print("[快速模式警告] 未测得稳定刷新率，暂按60Hz创建界面；最终实验前必须恢复实测。", flush=True)
-            else:
-                raise RuntimeError("未测得足够稳定的刷新率；不以猜测的60Hz继续实验")
+            raise RuntimeError("未测得足够稳定的刷新率；不以猜测的60Hz继续实验")
         self.refresh_hz = float(refresh)
         self.win.refreshThreshold = cfg.frame_long_factor / self.refresh_hz
         self.luminance = make_luminance_table(self.refresh_hz, cfg.stimulus_s)
@@ -1475,12 +1814,12 @@ class PsychoPyKeyboard:
             self._check_abort()
             self._draw_keys()
             flips.append(self.win.flip())
-        check = frame_diagnostics(flips, self.refresh_hz, cfg.frame_long_factor, cfg.frame_short_factor)
-        if not check['valid']:
-            if cfg.quick_entry_mode:
-                print("[快速模式警告] 静态绘制检测到异常帧间隔；当前联调继续进入键盘。", flush=True)
-            else:
-                raise RuntimeError("完整键盘静态绘制已出现异常帧间隔，请先解决显示/负载问题再启动刺激")
+        check = frame_diagnostics(flips, self.refresh_hz, cfg.frame_long_factor,
+                                  cfg.frame_short_factor, cfg.max_warning_frame_anomalies)
+        if check['hard_invalid']:
+            raise RuntimeError("完整键盘静态绘制出现多个异常帧间隔，请先解决显示/负载问题再启动刺激")
+        if check['warning']:
+            print("[显示时序警告] 静态绘制出现一个异常帧间隔；继续前请检查负载。", flush=True)
         framebuffer = getattr(self.win, "frameBufferSize", self.win.size)
         content_scale = self.win.getContentScaleFactor() if hasattr(self.win, 'getContentScaleFactor') else None
         self.display_info = {"window_size_reported": tuple(map(int, self.win.size)),
@@ -1569,6 +1908,35 @@ class PsychoPyKeyboard:
     def _phase(self, record: TrialRecord, name: str) -> None:
         record.phase_times.append((name, self.clock()))
 
+    def _persist_trial(self, record: TrialRecord) -> None:
+        if self.recorder is None:
+            return
+        self.recorder.write_trial(record)
+
+    @staticmethod
+    def _attach_failed_epoch(record: TrialRecord, exc: BaseException) -> None:
+        epoch = getattr(exc, "epoch", None)
+        if epoch is not None and record.result is None:
+            record.result = {"trial_id": record.trial_id, "epoch": epoch,
+                             "quality": epoch.diagnostics.get("quality")}
+
+    def _rejection_reason(self, result: dict[str, Any]) -> Optional[str]:
+        """可选的自由输入证据门；默认关闭，提示测试永远不调用。"""
+        if not self.cfg.rejection_enabled:
+            return None
+        scores = np.asarray(result.get("scores", []), dtype=float).ravel()
+        if scores.size == 0 or not np.isfinite(scores).all():
+            return "拒识：分类分数缺失或非有限"
+        ordered = np.sort(scores)
+        reasons = []
+        if self.cfg.rejection_min_score is not None and float(ordered[-1]) < self.cfg.rejection_min_score:
+            reasons.append(f"最高分{ordered[-1]:.6g}低于阈值{self.cfg.rejection_min_score:.6g}")
+        if self.cfg.rejection_min_margin is not None:
+            margin = float(ordered[-1] - (ordered[-2] if len(ordered) > 1 else 0.0))
+            if margin < self.cfg.rejection_min_margin:
+                reasons.append(f"第一/第二名分差{margin:.6g}低于阈值{self.cfg.rejection_min_margin:.6g}")
+        return "拒识：" + "; ".join(reasons) if reasons else None
+
     def _blank_until(self, when: float) -> None:
         while self.clock() < when:
             self._check_abort()
@@ -1637,19 +2005,19 @@ class PsychoPyKeyboard:
         record.actual_stimulus_s = offset_event.timestamp - onset_event.timestamp
         record.requested_window_start = onset_event.timestamp + cfg.response_delay_s
         record.requested_window_end = record.requested_window_start + cfg.window_s
-        record.frame_diagnostics = frame_diagnostics(record.frame_flip_times, self.refresh_hz,
-                                                     cfg.frame_long_factor, cfg.frame_short_factor)
+        record.frame_diagnostics = frame_diagnostics(
+            record.frame_flip_times, self.refresh_hz, cfg.frame_long_factor,
+            cfg.frame_short_factor, cfg.max_warning_frame_anomalies)
         record.frame_diagnostics['psychopy_frame_intervals_s'] = np.asarray(self.win.frameIntervals).copy()
         self._phase(record, "BLANK")
-        if not record.frame_diagnostics['valid']:
-            if cfg.quick_entry_mode:
-                print(f"[快速模式警告] trial {record.trial_id} 刺激帧时序异常："
-                      f"长间隔{record.frame_diagnostics['long_intervals']}，"
-                      f"短间隔{record.frame_diagnostics['short_intervals']}；当前联调继续分类。", flush=True)
-            else:
-                self._blank_until(offset_event.timestamp + cfg.blank_min_s)
-                raise InvalidTrial(f"刺激时序异常：长间隔{record.frame_diagnostics['long_intervals']}，"
-                                   f"短间隔{record.frame_diagnostics['short_intervals']}")
+        if record.frame_diagnostics['hard_invalid']:
+            self._blank_until(offset_event.timestamp + cfg.blank_min_s)
+            raise InvalidTrial(f"刺激时序异常：长间隔{record.frame_diagnostics['long_intervals']}，"
+                               f"短间隔{record.frame_diagnostics['short_intervals']}")
+        if record.frame_diagnostics['warning']:
+            print(f"[显示时序警告] trial {record.trial_id} 存在一个异常帧间隔："
+                  f"长间隔{record.frame_diagnostics['long_intervals']}，"
+                  f"短间隔{record.frame_diagnostics['short_intervals']}；继续分类。", flush=True)
         if self.markers.error is not None:
             raise InvalidTrial(f"LSL Marker发送失败：{self.markers.error}")
         self._phase(record, "WAIT_DATA_AND_CLASSIFY")
@@ -1671,6 +2039,15 @@ class PsychoPyKeyboard:
         if not 1 <= result['prediction'] <= len(TARGETS) or not 1 <= result['cca_prediction'] <= len(TARGETS):
             raise InvalidTrial("预测类别超出40目标范围")
         record.result = result
+        rejection_reason = self._rejection_reason(result) if free else None
+        if rejection_reason is not None:
+            record.status = "rejected"
+            record.reason = rejection_reason
+            self._phase(record, "FEEDBACK")
+            self.header.text = f"FREE | Selection {record.trial_id} | Rejected"
+            self.show_message(rejection_reason + "\n\nNo character added.\n"
+                              "Choose your next character in the next round.", cfg.feedback_s)
+            return
         self.ledger.apply_prediction(result['prediction'])
         record.text_applied = True
         record.status = "valid"
@@ -1696,7 +2073,7 @@ class PsychoPyKeyboard:
         self.event.getKeys(keyList=["1", "2", "num_1", "num_2", "space", "return", "num_enter"])
         previous = None
         self.header.text = "40-target SSVEP keyboard | Select a mode"
-        self.footer.text = "QUICK ENTRY | ESC: exit | No flicker until you press SPACE or ENTER"
+        self.footer.text = "ESC: exit | No flicker until you press SPACE or ENTER"
         while True:
             self._check_abort()
             keys = self.event.getKeys(keyList=["1", "2", "num_1", "num_2", "space", "return", "num_enter"])
@@ -1784,6 +2161,7 @@ class PsychoPyKeyboard:
                     record.reason = str(exc) or "KeyboardInterrupt"
                     self.cancel.set()
                 except Exception as exc:
+                    self._attach_failed_epoch(record, exc)
                     record.status = "valid" if record.text_applied else "invalid"
                     record.reason = f"{type(exc).__name__}: {exc}"
                     fatal = self.collector.error is not None or self.markers.error is not None
@@ -1809,6 +2187,7 @@ class PsychoPyKeyboard:
                         record.reason += f"; marker error: {exc}"
                         fatal = True
                     self.ledger.commit(record)
+                    self._persist_trial(record)
                     self._release_free_eeg(record)
                 if record.text_applied:
                     consecutive_invalid = 0
@@ -1859,7 +2238,9 @@ class PsychoPyKeyboard:
                 fatal = True
                 stop_reason = record.reason
             except Exception as exc:
-                record.status, record.reason = "invalid", f"{type(exc).__name__}: {exc}"
+                self._attach_failed_epoch(record, exc)
+                record.status = "valid" if record.text_applied else "invalid"
+                record.reason = f"{type(exc).__name__}: {exc}"
                 fatal = self.collector.error is not None or self.markers.error is not None
                 stop_reason = record.reason
             finally:
@@ -1868,7 +2249,7 @@ class PsychoPyKeyboard:
                     self.win.flip()  # 所有异常路径立即去掉闪烁画面
                 except Exception as clear_error:
                     # 例如用户关闭了窗口：即使清屏失败，也必须留下已开始试次的记录。
-                    if record.status != "aborted":
+                    if not record.text_applied and record.status != "aborted":
                         record.status = "invalid"
                     record.reason = (record.reason + f"; display-close error: {clear_error}").strip("; ")
                     stop_reason, fatal = record.reason, True
@@ -1879,11 +2260,12 @@ class PsychoPyKeyboard:
                         {"status": record.status, "reason": record.reason,
                          "prediction": record.result['prediction'] if record.result else None}))
                 except Exception as marker_error:
-                    if record.status != "aborted":
+                    if not record.text_applied and record.status != "aborted":
                         record.status = "invalid"
                     record.reason = (record.reason + f"; marker error: {marker_error}").strip("; ")
                     stop_reason, fatal = record.reason, True
                 self.ledger.commit(record)
+                self._persist_trial(record)
             if record.status == 'valid':
                 consecutive_invalid = 0
                 r = record.result
@@ -1946,13 +2328,14 @@ def main() -> dict:
     print("模式：启动界面1=自由输入（默认），2=提示测试；没有迷宫或操作系统按键注入。")
     print("自由输入不需要先做40轮测试；本版未添加个人校准或空闲检测，休息时按SPACE暂停。")
     if cfg.quick_entry_mode:
-        print("*** 当前为 QUICK ENTRY 快速联调模式：优先进入程序，严格时间戳/显示核验暂时放宽。 ***", flush=True)
+        print("*** QUICK ENTRY 仅跳过启动核验交互；时间戳、质量和显示门控仍然生效。 ***", flush=True)
     print(f"参数：M3七子带、{cfg.n_harmonics}谐波、a={cfg.weight_a}, b={cfg.weight_b}, target_fs={cfg.target_fs}Hz")
     print_target_mapping()
     collector = ContinuousLSL(cfg)
     ledger = TrialLedger()
     markers: Optional[EventMarkers] = None
     app: Optional[PsychoPyKeyboard] = None
+    recorder: Optional[SessionRecorder] = None
     review: dict = {}
     reason = "Not started"
     try:
@@ -1961,6 +2344,8 @@ def main() -> dict:
         print("[3/4] EEG已接收，快速模式直接继续…" if cfg.quick_entry_mode
               else "[3/4] EEG已接收，打开启动核验对话框…", flush=True)
         review = preflight_review(cfg, collector)
+        recorder = SessionRecorder(cfg, context={"mode_at_start": cfg.session_mode,
+                                                  "quick_entry_mode": cfg.quick_entry_mode})
         markers = EventMarkers(cfg, collector.clock)
         # 预热SciPy/BLAS与分类代码，但不使用真实目标，不计入准确率。
         t = np.arange(sample_count(cfg.window_s, cfg.target_fs)) / cfg.target_fs
@@ -1971,7 +2356,7 @@ def main() -> dict:
                 notch_hz=cfg.notch_hz, n_harmonics=cfg.n_harmonics,
                 a=cfg.weight_a, b=cfg.weight_b, regularization=cfg.cca_regularization)
         print("[4/4] 创建键盘窗口；在菜单按1自由输入、2提示测试，再按SPACE开始…", flush=True)
-        app = PsychoPyKeyboard(cfg, collector, markers, ledger)
+        app = PsychoPyKeyboard(cfg, collector, markers, ledger, recorder)
         reason = app.run()
     except (AbortSession, KeyboardInterrupt) as exc:
         reason = str(exc) or "用户中止"
@@ -1986,14 +2371,28 @@ def main() -> dict:
             markers.close()
         report = (summarize_free_trials(ledger.records, ledger) if cfg.session_mode == "free"
                   else summarize_trials(ledger.records, cfg.blocks * len(TARGETS)))
+        session_artifact = None
+        if recorder is not None:
+            try:
+                session_artifact = recorder.finalize(
+                    summary=report, events=markers.events if markers else [],
+                    acquisition_metadata=collector.metadata, acquisition_review=review,
+                    clock_updates=collector.clock_updates,
+                    display_info=app.display_info if app else {},
+                    typed_text=ledger.typed_text, stop_reason=reason)
+            except Exception as exc:
+                print(f"实验记录清单写入失败：{type(exc).__name__}: {exc}", flush=True)
         LAST_SESSION = {"mode": cfg.session_mode, "config": cfg, "targets": TARGETS, "records": ledger.records,
             "events": markers.events if markers else [], "acquisition_metadata": collector.metadata,
             "acquisition_review": review, "clock_updates": collector.clock_updates,
             "display_info": app.display_info if app else {}, "summary": report,
             "typed_text": ledger.typed_text, "stop_reason": reason,
+            "session_artifact": session_artifact,
             "marker_error": str(markers.error) if markers and markers.error else None,
             "validation_scope": "software events only; physical screen/device delays unmeasured"}
         print(f"\n结束原因：{reason}")
+        if session_artifact is not None:
+            print(f"实验记录已保存：{session_artifact}")
         if markers is not None and markers.error is not None:
             print(f"外部Marker发送存在错误：{markers.error}；请勿把本次外部Marker流视为完整。")
         if cfg.session_mode == "free":

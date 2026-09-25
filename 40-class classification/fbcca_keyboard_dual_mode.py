@@ -320,8 +320,14 @@ KEY_ROWS = (
     (*tuple("ASDFGHJKL"), "BACK"),
     ("SPACE", *tuple("ZXCVBNM,.")),
 )
-# 频率继续使用原行列公式；新布局的范围为8–17.6 Hz，不能沿用旧字符映射。
-TARGETS = tuple(Target(i + 1, symbol, r, c, round(8 + c + .2 * r, 1))
+# 频率按图片中的4×10交错表分配；布局和字符顺序保持不变。
+FREQUENCIES_HZ_BY_ROW = (
+    (8.0, 12.2, 8.4, 12.6, 8.8, 13.0, 9.2, 13.4, 9.6, 13.8),
+    (10.0, 14.2, 10.4, 14.6, 10.8, 15.0, 11.2, 15.4, 11.6, 15.8),
+    (12.0, 8.2, 12.4, 8.6, 12.8, 9.0, 13.2, 9.4, 13.6, 9.8),
+    (14.0, 10.2, 14.4, 10.6, 14.8, 11.0, 15.2, 11.4, 15.6, 11.8),
+)
+TARGETS = tuple(Target(i + 1, symbol, r, c, FREQUENCIES_HZ_BY_ROW[r][c])
                 for i, (r, c, symbol) in enumerate(
                     (r, c, symbol) for r, row in enumerate(KEY_ROWS) for c, symbol in enumerate(row)))
 BENCHMARK_FREQUENCIES_HZ = np.asarray([t.frequency_hz for t in TARGETS])

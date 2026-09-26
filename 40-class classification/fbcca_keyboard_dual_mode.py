@@ -225,6 +225,7 @@ class Config:
     quality_rail_max: Optional[float] = None
     quality_clip_tolerance: float = 0.0
     quality_jump_z: float = 12.0
+    # 只有用明确注视/不输入的真实EEG标定并用独立数据验证后才填写；None不猜测。
     rejection_enabled: bool = False
     rejection_min_score: Optional[float] = None
     rejection_min_margin: Optional[float] = None
@@ -268,6 +269,17 @@ class Config:
     @property
     def stimulus_s(self) -> float:
         return self.window_s
+
+    @property
+    def rejection_thresholds_configured(self) -> bool:
+        """Whether free mode has an explicitly enabled, two-threshold gate."""
+        return bool(
+            self.rejection_enabled
+            and self.rejection_min_score is not None
+            and self.rejection_min_margin is not None
+            and math.isfinite(float(self.rejection_min_score))
+            and math.isfinite(float(self.rejection_min_margin))
+        )
 
     def validate(self) -> None:
         _ = self.window_s
@@ -321,8 +333,6 @@ class Config:
             value = getattr(self, name)
             if value is not None and (not math.isfinite(value) or value < 0):
                 raise ValueError(f"{name} 必须非负且有限")
-        if self.rejection_enabled and self.rejection_min_score is None and self.rejection_min_margin is None:
-            raise ValueError("启用拒识时至少配置 rejection_min_score 或 rejection_min_margin")
         _validate_fs(self.target_fs)
         _normalise_channel_indices(self.channel_indices)
         if len(self.channel_indices) != len(self.channel_positions):
@@ -414,6 +424,16 @@ def _normalise_channel_indices(channel_indices: Optional[Sequence[int]]) -> np.n
     return indices
 
 
+def _validate_eeg_ct(data: np.ndarray, *, name: str = "EEG",
+                     allow_empty_samples: bool = False) -> np.ndarray:
+    """Return an EEG matrix with the single internal layout: channels × samples."""
+    x = np.asarray(data, dtype=float)
+    if x.ndim != 2 or x.shape[0] < 1 or (
+            not allow_empty_samples and x.shape[1] < 1):
+        raise ValueError(f"{name}必须是二维C×T数组（通道数×采样点数）")
+    return x
+
+
 def sample_count(duration_s: float, fs: float) -> int:
     """[start, end)内的均匀采样点数；1.25s×250Hz需要313点而非静默截掉半点。
 
@@ -460,8 +480,8 @@ def _normalised_rows(data: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     阈值仅用于“相对于该行原始幅值”的数值可分辨性，不是固定伏值下限。
     返回非恒值行及它们的索引；全零/全恒值输入明确报错。
     """
-    x = np.asarray(data, dtype=np.float64)
-    if x.ndim != 2 or x.shape[0] < 1 or x.shape[1] < 2 or not np.isfinite(x).all():
+    x = _validate_eeg_ct(data, name="输入")
+    if x.shape[1] < 2 or not np.isfinite(x).all():
         raise ValueError("输入须为有限二维数组(channels, samples)，至少2个样本")
     amplitude = np.max(np.abs(x), axis=1, keepdims=True)
     scaled = np.divide(x, amplitude, out=np.zeros_like(x), where=amplitude > 0)
@@ -486,8 +506,11 @@ def assess_signal_quality(data: np.ndarray, *, unit: str = "UNKNOWN",
     绝对幅值和削顶只有在设备单位/轨值明确时才有物理意义；未知单位只产生
     警告，避免把任意 LSL 数值误当成微伏或伏特。返回的摘要可直接写入试次日志。
     """
-    x = np.asarray(data, dtype=np.float64)
-    if x.ndim != 2 or min(x.shape, default=0) < 2:
+    try:
+        x = _validate_eeg_ct(data, name="原始EEG")
+    except ValueError as exc:
+        raise InvalidTrial("原始EEG形状不足，无法进行质量检查") from exc
+    if min(x.shape, default=0) < 2:
         raise InvalidTrial("原始EEG形状不足，无法进行质量检查")
     report: dict[str, Any] = {
         "unit": str(unit), "hard_fail": False, "hard_reasons": [], "warnings": [],
@@ -624,8 +647,8 @@ def preprocess_lsl_window(data_ch_samples: np.ndarray, fs: float,
     from scipy.signal import cheby1, filtfilt, iirnotch, resample_poly, sosfiltfilt
     _validate_fs(fs)
     _validate_fs(target_fs)
-    data = np.asarray(data_ch_samples, float)
-    if data.ndim != 2 or min(data.shape) < 1 or not np.isfinite(data).all():
+    data = _validate_eeg_ct(data_ch_samples, name="LSL数据")
+    if not np.isfinite(data).all():
         raise ValueError("LSL数据须为有限(channels, samples)数组")
     if not np.isfinite(window_s) or window_s <= 0 or not np.isfinite(onset_s) or onset_s < 0:
         raise ValueError("window_s须为正、onset_s须非负")
@@ -669,8 +692,8 @@ def classify_eeg_window(data_ch_samples: np.ndarray, fs: float,
                    else np.asarray(target_frequencies_hz, float))
     _validate_fs(fs)
     _validate_fs(target_fs)
-    data = np.asarray(data_ch_samples, float)
-    if data.ndim != 2 or not np.isfinite(window_s) or window_s <= 0 or not np.isfinite(onset_s) or onset_s < 0:
+    data = _validate_eeg_ct(data_ch_samples, name="EEG")
+    if not np.isfinite(window_s) or window_s <= 0 or not np.isfinite(onset_s) or onset_s < 0:
         raise ValueError("EEG须二维，窗长为正，偏移非负")
     start, length = round(onset_s * fs), sample_count(window_s, fs)
     if length < 32 or start + length > data.shape[1]:
@@ -712,9 +735,41 @@ class Epoch:
     source_data: np.ndarray
     uniform_timestamps: np.ndarray
 
+    def __post_init__(self) -> None:
+        self.data = _validate_eeg_ct(self.data, name="Epoch.data",
+                                     allow_empty_samples=True)
+        self.source_data = _validate_eeg_ct(
+            self.source_data, name="Epoch.source_data", allow_empty_samples=True)
+        self.raw_timestamps = np.asarray(self.raw_timestamps, dtype=float)
+        self.local_timestamps = np.asarray(self.local_timestamps, dtype=float)
+        self.clock_corrections = np.asarray(self.clock_corrections, dtype=float)
+        self.uniform_timestamps = np.asarray(self.uniform_timestamps, dtype=float)
+        self.validate_dimensions()
+
+    def validate_dimensions(self) -> None:
+        """Validate C×T arrays and their one-dimensional time axes."""
+        if self.data.shape[0] != self.source_data.shape[0]:
+            raise ValueError("Epoch.data 与 Epoch.source_data 通道数不一致")
+        for name, timestamps in (
+                ("raw_timestamps", self.raw_timestamps),
+                ("local_timestamps", self.local_timestamps),
+                ("clock_corrections", self.clock_corrections)):
+            if timestamps.ndim != 1:
+                raise ValueError(f"Epoch.{name}必须是一维时间轴")
+            if len(timestamps) != self.source_data.shape[1]:
+                raise ValueError(
+                    f"Epoch.{name}长度必须等于source_data的采样点数")
+        if self.uniform_timestamps.ndim != 1:
+            raise ValueError("Epoch.uniform_timestamps必须是一维时间轴")
+        if len(self.uniform_timestamps) != self.data.shape[1]:
+            raise ValueError(
+                "Epoch.uniform_timestamps长度必须等于data的采样点数")
+
 
 class TimestampBuffer:
-    """有界环形缓冲：样本、原始时间、校正时间、校正量和有效性均保留。
+    """有界环形缓冲：EEG样本始终按C×T存储，时间轴始终是一维。
+
+    样本、原始时间、校正时间、校正量和有效性均保留。
 
     重复/逆序时间戳不排序、不删除：明确失败，防止伪造连续数据。
     NaN样本保留并打标，仅令覆盖它的试次无效。
@@ -723,7 +778,7 @@ class TimestampBuffer:
         if capacity < 2 or n_channels < 1:
             raise ValueError("缓冲容量/通道数不合法")
         self.capacity, self.n_channels = capacity, n_channels
-        self.samples = np.empty((capacity, n_channels))
+        self.samples = np.empty((n_channels, capacity))
         self.raw_ts = np.empty(capacity)
         self.local_ts = np.empty(capacity)
         self.corrections = np.empty(capacity)
@@ -735,8 +790,8 @@ class TimestampBuffer:
     def append(self, samples: np.ndarray, raw_ts: np.ndarray, correction: Any,
                device_lag_s: float = 0.0) -> None:
         x, raw = np.asarray(samples, float), np.asarray(raw_ts, float)
-        if raw.ndim != 1 or x.ndim != 2 or x.shape != (len(raw), self.n_channels):
-            raise ValueError("EEG样本/时间戳维度不一致")
+        if raw.ndim != 1 or x.ndim != 2 or x.shape != (self.n_channels, len(raw)):
+            raise ValueError("EEG样本必须为C×T，且T必须与时间戳长度一致")
         if not len(raw):
             return
         corrections = np.asarray(correction, dtype=float)
@@ -786,13 +841,14 @@ class TimestampBuffer:
             self.last_raw, self.last_local = float(raw[-1]), float(local[-1])
             self.total_received += len(raw)
             if len(raw) >= self.capacity:
-                x, raw, local, corrections = (v[-self.capacity:] for v in
-                                               (x, raw, local, corrections))
+                x = x[:, -self.capacity:]
+                raw, local, corrections = (v[-self.capacity:] for v in
+                                            (raw, local, corrections))
             n = len(raw)
             indices = (self.cursor + np.arange(n)) % self.capacity
-            self.samples[indices], self.raw_ts[indices], self.local_ts[indices] = x, raw, local
+            self.samples[:, indices], self.raw_ts[indices], self.local_ts[indices] = x, raw, local
             self.corrections[indices] = corrections
-            self.valid[indices] = np.isfinite(x).all(axis=1)
+            self.valid[indices] = np.isfinite(x).all(axis=0)
             self.cursor = (self.cursor + n) % self.capacity
             self.size = min(self.capacity, self.size + n)
 
@@ -804,7 +860,7 @@ class TimestampBuffer:
     def snapshot(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         with self.lock:
             indices = (self.cursor - self.size + np.arange(self.size)) % self.capacity
-            return (self.samples[indices].copy(), self.raw_ts[indices].copy(),
+            return (self.samples[:, indices].copy(), self.raw_ts[indices].copy(),
                     self.local_ts[indices].copy(), self.corrections[indices].copy(), self.valid[indices].copy())
 
     def epoch(self, start: float, duration_s: float, nominal_fs: float,
@@ -821,10 +877,14 @@ class TimestampBuffer:
             raise InvalidTrial("事件窗口数据未到齐或已被缓冲覆盖")
         left = int(np.searchsorted(local, start, side="right") - 1)
         right = int(np.searchsorted(local, end, side="left"))
-        x, raw, local, corrections, valid = (v[left:right + 1] for v in (x, raw, local, corrections, valid))
+        x = x[:, left:right + 1]
+        raw = raw[left:right + 1]
+        local = local[left:right + 1]
+        corrections = corrections[left:right + 1]
+        valid = valid[left:right + 1]
         def failure_epoch(message: str) -> Epoch:
             return Epoch(
-                np.empty((x.shape[0], 0), dtype=float), nominal_fs, start, end,
+                np.empty((self.n_channels, 0), dtype=float), nominal_fs, start, end,
                 raw.copy(), local.copy(), corrections.copy(), {"hard_reason": message},
                 x.copy(), np.empty(0, dtype=float))
         if len(local) < 3 or not np.all(valid):
@@ -864,7 +924,7 @@ class TimestampBuffer:
             raise InvalidTrial(message, epoch=failure_epoch(message))
         # 仅在已验证无明确缺样后，把轻微时间抖动对齐到统一时间网格。
         # 保留高原始采样率后交给resample_poly抗混叠降采样，不能直接插值到250 Hz。
-        uniform = np.vstack([np.interp(grid, local, channel) for channel in x.T])
+        uniform = np.asarray([np.interp(grid, local, channel) for channel in x], dtype=float)
         return Epoch(uniform, nominal_fs, start, end, raw.copy(), local.copy(), corrections.copy(), {
             "source_support_samples": len(local), "uniform_samples": len(grid),
             "timestamp_estimated_fs": float(measured_fs), "source_clock_estimated_fs": float(raw_measured_fs),
@@ -1064,14 +1124,15 @@ class ContinuousLSL:
 
                 last_arrival = time.monotonic()
                 x = np.asarray(samples, float)
-                if x.ndim != 2 or x.shape[1] <= max(self.cfg.channel_indices):
+                incoming_ts = np.asarray(ts, dtype=float)
+                if (x.ndim != 2 or x.shape[0] != len(incoming_ts)
+                        or x.shape[1] <= max(self.cfg.channel_indices)):
                     raise InvalidTrial("EEG流通道数或形状发生变化")
 
-                incoming_ts = np.asarray(ts, dtype=float)
                 applied_corrections = correction_state.apply(incoming_ts)
 
                 self.buffer.append(
-                    x[:, self.cfg.channel_indices], incoming_ts, applied_corrections,
+                    x[:, self.cfg.channel_indices].T, incoming_ts, applied_corrections,
                     self.cfg.device_timestamp_lag_s
                 )
 
@@ -1363,6 +1424,7 @@ class SessionRecorder:
         if frame_intervals is not None:
             arrays["psychopy_frame_intervals_s"] = np.asarray(frame_intervals, dtype=float)
         if epoch is not None:
+            epoch.validate_dimensions()
             arrays.update({
                 "source_data": np.asarray(epoch.source_data, dtype=float),
                 "source_raw_timestamps": np.asarray(epoch.raw_timestamps, dtype=float),
@@ -1399,6 +1461,7 @@ class SessionRecorder:
             "prediction": result.get("prediction"),
             "frequency_hz": result.get("frequency_hz"),
             "scores": result.get("scores"),
+            "rejection_diagnostics": result.get("rejection_diagnostics"),
             "cca_prediction": result.get("cca_prediction"),
             "cca_frequency_hz": result.get("cca_frequency_hz"),
             "cca_scores": result.get("cca_scores"),
@@ -1920,22 +1983,98 @@ class PsychoPyKeyboard:
             record.result = {"trial_id": record.trial_id, "epoch": epoch,
                              "quality": epoch.diagnostics.get("quality")}
 
-    def _rejection_reason(self, result: dict[str, Any]) -> Optional[str]:
-        """可选的自由输入证据门；默认关闭，提示测试永远不调用。"""
-        if not self.cfg.rejection_enabled:
-            return None
-        scores = np.asarray(result.get("scores", []), dtype=float).ravel()
+    def _rejection_diagnostics(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Evaluate the free-mode evidence gate without treating scores as probabilities."""
+        cfg = self.cfg
+        min_score = (None if cfg.rejection_min_score is None
+                     else float(cfg.rejection_min_score))
+        min_margin = (None if cfg.rejection_min_margin is None
+                      else float(cfg.rejection_min_margin))
+        configured = cfg.rejection_thresholds_configured
+        max_score: Optional[float] = None
+        score_margin: Optional[float] = None
+        reason_codes: list[str] = []
+        reasons: list[str] = []
+
+        if not configured:
+            reason_codes.append("thresholds_unconfigured")
+            reasons.append(
+                "拒识阈值未完整配置；请先用明确注视目标和不打算输入的真实EEG数据标定，"
+                "再用独立数据验证")
+
+        try:
+            scores = np.asarray(result.get("scores", []), dtype=float).ravel()
+        except (TypeError, ValueError):
+            scores = np.empty(0, dtype=float)
         if scores.size == 0 or not np.isfinite(scores).all():
-            return "拒识：分类分数缺失或非有限"
-        ordered = np.sort(scores)
-        reasons = []
-        if self.cfg.rejection_min_score is not None and float(ordered[-1]) < self.cfg.rejection_min_score:
-            reasons.append(f"最高分{ordered[-1]:.6g}低于阈值{self.cfg.rejection_min_score:.6g}")
-        if self.cfg.rejection_min_margin is not None:
-            margin = float(ordered[-1] - (ordered[-2] if len(ordered) > 1 else 0.0))
-            if margin < self.cfg.rejection_min_margin:
-                reasons.append(f"第一/第二名分差{margin:.6g}低于阈值{self.cfg.rejection_min_margin:.6g}")
-        return "拒识：" + "; ".join(reasons) if reasons else None
+            reason_codes.append("scores_missing_or_nonfinite")
+            reasons.append("分类分数缺失或非有限")
+        else:
+            ordered = np.sort(scores)
+            max_score = float(ordered[-1])
+            if ordered.size < 2:
+                reason_codes.append("insufficient_scores")
+                reasons.append("候选分数少于两个，无法计算第一/第二名分差")
+            else:
+                score_margin = float(ordered[-1] - ordered[-2])
+                if configured and max_score < float(min_score):
+                    reason_codes.append("score_below_threshold")
+                    reasons.append(
+                        f"最高分{max_score:.6g}低于阈值{float(min_score):.6g}")
+                if configured and score_margin < float(min_margin):
+                    reason_codes.append("margin_below_threshold")
+                    reasons.append(
+                        f"第一/第二名分差{score_margin:.6g}低于阈值{float(min_margin):.6g}")
+
+        accepted = bool(
+            configured
+            and max_score is not None
+            and score_margin is not None
+            and max_score >= float(min_score)
+            and score_margin >= float(min_margin)
+            and not reason_codes
+        )
+        if accepted:
+            reason_codes = []
+            reason = None
+            reason_code = None
+        else:
+            # Keep a stable, inspectable code while retaining all contributing
+            # codes for diagnostics and post-session analysis.
+            reason_code = "+".join(reason_codes) or "rejected"
+            reason = "拒识：" + "; ".join(reasons)
+        return {
+            "configured": configured,
+            "accepted": accepted,
+            "max_score": max_score,
+            "score_margin": score_margin,
+            "min_score": min_score,
+            "min_margin": min_margin,
+            "reason_code": reason_code,
+            "reason_codes": reason_codes,
+            "reason": reason,
+        }
+
+    def _rejection_reason(self, result: dict[str, Any]) -> Optional[str]:
+        """Return the free-mode rejection message, if the evidence gate fails."""
+        return self._rejection_diagnostics(result)["reason"]
+
+    def _rejection_diagnostics_for_mode(self, mode: str,
+                                        result: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Apply the gate only to free input; cued mode remains the baseline."""
+        return self._rejection_diagnostics(result) if mode == "free" else None
+
+    @staticmethod
+    def _rejection_calibration_notice() -> str:
+        return (
+            "Rejection thresholds are not configured.\n\n"
+            "Before FREE INPUT can add a character, space, or delete action, "
+            "calibrate both thresholds with real EEG while looking at an intended "
+            "target and while not intending to enter text, then verify them on "
+            "independent data.\n\n"
+            "FBCCA scores are not probabilities. This gate is not validated "
+            "automatic idle detection; no text will be entered until it is configured."
+        )
 
     def _blank_until(self, when: float) -> None:
         while self.clock() < when:
@@ -2039,8 +2178,11 @@ class PsychoPyKeyboard:
         if not 1 <= result['prediction'] <= len(TARGETS) or not 1 <= result['cca_prediction'] <= len(TARGETS):
             raise InvalidTrial("预测类别超出40目标范围")
         record.result = result
-        rejection_reason = self._rejection_reason(result) if free else None
-        if rejection_reason is not None:
+        rejection_diagnostics = self._rejection_diagnostics_for_mode(record.mode, result)
+        if rejection_diagnostics is not None:
+            result["rejection_diagnostics"] = rejection_diagnostics
+        if rejection_diagnostics is not None and not rejection_diagnostics["accepted"]:
+            rejection_reason = rejection_diagnostics["reason"]
             record.status = "rejected"
             record.reason = rejection_reason
             self._phase(record, "FEEDBACK")
@@ -2138,11 +2280,26 @@ class PsychoPyKeyboard:
         record.frame_diagnostics.pop("intervals_s", None)
         record.frame_diagnostics.pop("psychopy_frame_intervals_s", None)
 
+    @staticmethod
+    def _advance_free_invalid_streak(current: int, record: TrialRecord,
+                                     *, pause_requested: bool,
+                                     exit_requested: bool) -> int:
+        """Count only real failed trials; normal rejection is not a fault."""
+        if (pause_requested or exit_requested or record.text_applied
+                or record.status == "rejected"):
+            return 0
+        return current + 1
+
     def _run_free(self) -> str:
-        self._pause_enabled = True
+        self._pause_enabled = False
         selection_id = 0
         consecutive_invalid = 0
         try:
+            if not self.cfg.rejection_thresholds_configured:
+                notice = self._rejection_calibration_notice()
+                print("[自由输入保护] " + notice.replace("\n", " "), flush=True)
+                self.show_message(notice, max(self.cfg.feedback_s, 2.0))
+            self._pause_enabled = True
             while True:
                 selection_id += 1
                 record = TrialRecord(selection_id, 1, None, mode="free", start=self.clock())
@@ -2182,6 +2339,9 @@ class PsychoPyKeyboard:
                         self.markers.mark(EventStamp("selection_end", record.trial_id, None,
                             {"mode": "free", "status": record.status, "reason": record.reason,
                              "prediction": record.result['prediction'] if record.result else None,
+                             "rejection_diagnostics": (
+                                 record.result.get("rejection_diagnostics")
+                                 if record.result else None),
                              "text_applied": record.text_applied}))
                     except Exception as exc:
                         record.reason += f"; marker error: {exc}"
@@ -2194,10 +2354,15 @@ class PsychoPyKeyboard:
                     pred = TARGETS[record.result['prediction'] - 1]
                     print(f"FREE {selection_id:04d}: FBCCA={pred.symbol} ({pred.frequency_hz:.1f}Hz)"
                           f" | text={self.ledger.typed_text!r}", flush=True)
+                elif record.status == "rejected":
+                    # A normal evidence-gate rejection is not an acquisition,
+                    # data, or timing fault and must not create a fault streak.
+                    print(f"FREE {selection_id:04d}: rejected | {record.reason}", flush=True)
                 else:
                     print(f"FREE {selection_id:04d}: no character added | {record.reason}", flush=True)
-                    if not pause_requested and not exit_requested:
-                        consecutive_invalid += 1
+                consecutive_invalid = self._advance_free_invalid_streak(
+                    consecutive_invalid, record,
+                    pause_requested=pause_requested, exit_requested=exit_requested)
                 if exit_requested or fatal:
                     return record.reason or "Free spelling stopped"
                 if pause_requested:

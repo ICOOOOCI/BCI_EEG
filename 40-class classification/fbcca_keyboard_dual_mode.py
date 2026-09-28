@@ -1,15 +1,15 @@
 """40-target SSVEP keyboard: FREE SPELLING + CUED TEST.
 
-基于 fbcca_keyboard_quick_start_with_output.py 增加模式选择。
 启动界面：1=自由输入，2=提示测试（默认）；SPACE/ENTER开始，ESC退出。
-提示测试：高亮目标至少1秒，SPACE确认后稳定注视0.5秒，再开始闪烁。
+启动前静态预览：调整尺寸/间距/距离，逐个检查四角；--preview-layout 可单独预览。
+提示测试：SPACE启动整组；每个目标按固定提示、稳定注视和闪烁时序自动推进。
 自由输入：自行注视字符，每轮真实LSL EEG经FBCCA识别后写入顶部OUTPUT框。
 电脑键盘SPACE暂停/继续；屏幕内SPACE目标插入空格，BACK目标删除上一字符。
-采用4×10 QWERTY布局；按新行列重排40类及频率（8–17.6 Hz）。
+采用4×10 QWERTY布局；按新行列重排40类及频率（8–15.8 Hz）。
 默认使用抗工频的48Hz上限、三谐波配置；原M3配置仍可在Config中选择。
-本版不是个人校准程序，也没有自动空闲检测；快速模式只用于跳过启动核验交互。
-不包含迷宫，不注入操作系统按键；每轮实验记录保存为JSON和NPZ。
-取得首个试次的EEG数据后才建立临时记录目录；结束后合并成一份会话NPZ文件。
+本版不是个人校准程序，也没有自动空闲检测；CMD快速模式只跳过启动核验弹窗。
+不包含迷宫，不注入操作系统按键；首次取得试次EEG后暂存逐试次数据。
+导出成功后只保留一份含元数据和试次数组的会话NPZ；导出失败时保留临时目录。
 算法函数仍可import调用；import不会安装依赖或启动闪烁。
 
 UI API references checked 2026-09-17:
@@ -19,141 +19,15 @@ https://psychopy.org/api/visual/window.html
 """
 from __future__ import annotations
 
-# ======================== 启动时自动检查/安装运行依赖 ========================
-# 只在“直接运行本文件”时执行；如果本文件被其他代码 import，不会擅自安装软件包。
-# 使用 sys.executable -m pip，确保依赖安装到“当前正在运行本程序的 Python/虚拟环境”。
-import importlib
-import importlib.util
-import subprocess
+# 所有直接启动均先经过只读环境检查；import 仍可用于离线算法分析。
 import sys
 
-
-def _configure_console_encoding() -> None:
-    """让旧版 Windows 控制台也能显示启动诊断，不改变文件输出。"""
-    for stream_name in ("stdout", "stderr"):
-        stream = getattr(sys, stream_name, None)
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is not None:
-            try:
-                reconfigure(encoding="utf-8", errors="replace")
-            except (OSError, ValueError):
-                # 某些 IDE 将 stdout 替换成不支持 reconfigure 的对象；
-                # 诊断输出仍应继续执行。
-                pass
-
-
-_configure_console_encoding()
-
-_REQUIRED_PACKAGES = {
-    "numpy": "numpy",
-    "scipy": "scipy",
-    "pylsl": "pylsl",
-    "psychopy": "psychopy",
-    "threadpoolctl": "threadpoolctl",
-}
-
-# PsychoPy 2026.x still declares ``pywinhook`` as a Windows dependency.  That
-# package has no Python 3.12 wheel and its source build requires SWIG, so a
-# normal ``pip install psychopy`` aborts before *any* package is installed.
-# The keyboard handling used by this program is PsychoPy's pyglet backend and
-# does not need pywinhook.  Install PsychoPy's published dependencies in a
-# separate step and install PsychoPy with ``--no-deps``; this keeps the
-# optional legacy hook from blocking the actual display application.
-_PSYCHOPY_DEPENDENCIES = (
-    "matplotlib", "pyglet==1.4.11", "pillow>=9.4.0", "pyqt6", "pandas>=1.5.3",
-    "questplus>=2023.1", "openpyxl", "xmlschema", "soundfile", "sounddevice",
-    "psychtoolbox", "imageio", "imageio-ffmpeg", "zope.event==5.0",
-    "zope.interface==7.2", "gevent==25.5.1", "MeshPy", "psutil", "pyzmq>=22.2.1",
-    "ujson", "msgpack", "msgpack-numpy", "pyyaml", "freetype-py", "python-bidi",
-    "arabic-reshaper", "websockets", "requests", "i18next", "astunparse", "esprima",
-    "jedi>=0.16", "pyserial", "pyparallel", "ffpyplayer", "opencv-python",
-    "python-vlc>=3.0.21203", "pypiwin32", "tables", "packaging>=24.0", "moviepy",
-    "pyarrow", "beautifulsoup4",
-)
-
-
-def _ensure_runtime_dependencies() -> None:
-    """缺什么装什么；已安装的包不会重复安装。"""
-    missing = [
-        pip_name
-        for import_name, pip_name in _REQUIRED_PACKAGES.items()
-        if importlib.util.find_spec(import_name) is None
-    ]
-
-    print("\n=== Python 运行依赖检查 ===", flush=True)
-    print("当前 Python：" + sys.executable, flush=True)
-    if not missing:
-        print("[OK] 主包均已找到；继续验证界面模块是否能实际加载。", flush=True)
-        return
-
-    print("检测到缺失依赖：" + ", ".join(missing), flush=True)
-    print("将自动安装到当前 Python：" + sys.executable, flush=True)
-
-    # venv 通常自带 pip；若某个环境没有 pip，则先用标准库 ensurepip 恢复。
-    pip_check = subprocess.run(
-        [sys.executable, "-m", "pip", "--version"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if pip_check.returncode != 0:
-        print("当前环境未检测到可用 pip，正在尝试启用 pip...", flush=True)
-        try:
-            subprocess.check_call([sys.executable, "-m", "ensurepip", "--upgrade"])
-        except Exception as exc:
-            raise RuntimeError(
-                "当前 Python 环境没有可用 pip，且 ensurepip 启用失败。"
-                f"\nPython: {sys.executable}\n原始错误: {exc}"
-            ) from exc
-
-    try:
-        # Do not let PsychoPy's pywinhook dependency force a native build.
-        # Install the scientific/LSL packages and PsychoPy's other runtime
-        # dependencies first, then install PsychoPy itself without resolving
-        # dependencies a second time.
-        base_missing = [name for name in missing if name != "psychopy"]
-        psychopy_missing = "psychopy" in missing
-        if base_missing or psychopy_missing:
-            deps = list(dict.fromkeys(base_missing + list(_PSYCHOPY_DEPENDENCIES)))
-            if deps:
-                deps_cmd = [sys.executable, "-m", "pip", "install",
-                            "--disable-pip-version-check", *deps]
-                print("执行核心依赖安装（跳过不兼容的 pywinhook）：" +
-                      " ".join(deps_cmd), flush=True)
-                subprocess.check_call(deps_cmd)
-        if psychopy_missing:
-            psychopy_cmd = [sys.executable, "-m", "pip", "install",
-                            "--disable-pip-version-check", "--no-deps", "psychopy"]
-            print("执行 PsychoPy 安装（不拉取 pywinhook）：" +
-                  " ".join(psychopy_cmd), flush=True)
-            subprocess.check_call(psychopy_cmd)
-    except subprocess.CalledProcessError as exc:
-        failed_cmd = " ".join(str(x) for x in (getattr(exc, "cmd", None) or []))
-        raise RuntimeError(
-            "自动安装依赖失败。请检查网络、pip 源或该 Python 版本是否受依赖支持。"
-            f"\n失败依赖: {', '.join(missing)}"
-            f"\nPython: {sys.executable}"
-            f"\n命令: {failed_cmd}"
-            f"\npip 退出码: {exc.returncode}"
-        ) from exc
-
-    importlib.invalidate_caches()
-    still_missing = [
-        import_name
-        for import_name in _REQUIRED_PACKAGES
-        if importlib.util.find_spec(import_name) is None
-    ]
-    if still_missing:
-        raise RuntimeError(
-            "pip 已执行完成，但仍找不到以下模块：" + ", ".join(still_missing)
-            + f"\n当前 Python: {sys.executable}"
-        )
-
-    print("[完成] 缺失依赖已自动安装，继续启动 FBCCA 程序。\n", flush=True)
-
-
 if __name__ == "__main__":
-    _ensure_runtime_dependencies()
+    from run_keyboard import cli
+    raise SystemExit(cli())
+
+from runtime_support import (RuntimeFault, environment_snapshot, fault_record, print_fault,
+                             probe_save_directory)
 
 import os
 # 避免小型 CCA 矩阵运算动用大量 BLAS 线程；已有环境设置不覆盖。
@@ -163,7 +37,6 @@ for _name in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS"):
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
 import queue
 import tempfile
@@ -174,7 +47,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from typing import Any, Callable, Optional, Sequence
 
@@ -189,14 +62,14 @@ class Config:
     # 启动界面按1/2选择，SPACE或ENTER开始；默认进行40目标提示测试。
     session_mode: str = "cued"
     free_prepare_s: float = 1.0  # 每轮闪烁前留出时间，自行选择下一个字符。
-    # 两种模式默认闪烁/分析各1.5秒；与旧5秒会话分开比较。
+    # 两种模式默认分析窗1.5秒；闪烁额外覆盖0.14秒起始延迟及帧余量。
     protocol: str = "short_1p5s"
-    # 快速模式只影响启动核验交互；不放宽时间戳、质量或显示时序门控。
+    # 快速模式只跳过启动核验弹窗；保留模式菜单及时间戳、质量、显示时序门控。
     quick_entry_mode: bool = False
     blocks: int = 1
     random_seed: int = 20260928
-    cue_s: float = 1.0  # 模式2最短定位提示；结束后等待新的SPACE确认。
-    cued_settle_s: float = 0.5  # 确认后保持静态高亮，留出稳定注视时间。
+    cue_s: float = 2.0  # 模式2每个目标的固定定位提示时长，无需逐试次按键。
+    cued_settle_s: float = 0.5  # 提示后保持静态高亮，留出稳定注视时间。
     response_delay_s: float = 0.14
     blank_min_s: float = 0.5
     feedback_s: float = 0.5
@@ -240,9 +113,10 @@ class Config:
     quality_max_abs: Optional[float] = None
     quality_rail_min: Optional[float] = None
     quality_rail_max: Optional[float] = None
-    quality_clip_tolerance: float = 0.0
+    quality_rail_margin: float = 0.0  # 与设备轨值相同的EEG数值单位。
+    quality_max_clip_fraction: float = 0.0  # 每通道允许的削顶样本比例，[0, 1)。
     quality_jump_z: float = 12.0
-    # 只有用明确注视/不输入的真实EEG标定并用独立数据验证后才填写；None不猜测。
+    # 默认直接采用有效试次的分类结果；启用拒识前须用真实EEG标定并验证两个阈值。
     rejection_enabled: bool = False
     rejection_min_score: Optional[float] = None
     rejection_min_margin: Optional[float] = None
@@ -262,14 +136,19 @@ class Config:
     weight_a: float = 1.25
     weight_b: float = 0.25
     notch_hz: Optional[float] = 50.0  # 保留原文件50 Hz; 按采集地供电/已有滤波核对。
+    # 默认关闭；2026-09-28离线探索的待复测方案，不替代采集端工频排查。
+    line_regression_hz: Optional[float] = None
     cca_regularization: float = 1e-10
 
-    full_screen: bool = True
+    full_screen: bool = True  # Windows/macOS 默认铺满目标显示器；仅调试时关闭。
     screen_index: int = 0
-    window_size: tuple[int, int] = (1920, 1080)
-    key_size_px: float = 140.0  # 1920×1080参考尺寸；大屏最多放大25%。
-    key_gap_px: float = 50.0  # 最小参考间距；剩余空间分别分配到行、列之间。
-    allow_layout_scaling: bool = True  # 按屏幕缩放方块；False固定方块尺寸，间距仍自适应。
+    window_size: tuple[int, int] = (1920, 1080)  # 仅用于非全屏调试窗口。
+    layout_units: str = "pixels"  # pixels=实际绘制像素；degrees=按观看距离换算中心视角。
+    key_size_px: float = 140.0
+    key_gap_px: float = 30.0  # 行列使用相同边缘间距，剩余空间留在网格外侧。
+    key_size_deg: float = 2.0
+    key_gap_deg: float = 0.5
+    allow_layout_scaling: bool = True  # 放不下时整体缩小；预览显示实际尺寸和缩放比例。
     viewing_distance_cm: float = 70.0  # 目标观看距离，不代表自动测量结果。
     screen_diagonal_inches: Optional[float] = None
     frame_long_factor: float = 1.5
@@ -288,7 +167,8 @@ class Config:
 
     @property
     def stimulus_s(self) -> float:
-        return self.window_s
+        # 分类窗从刺激起点延后 response_delay_s，必须在持续闪烁时结束。
+        return self.response_delay_s + self.window_s
 
     @property
     def filter_bands(self) -> tuple[tuple[float, float], ...]:
@@ -341,6 +221,15 @@ class Config:
                 raise ValueError(f"{name} 必须为有限正数")
         if not math.isfinite(self.key_gap_px) or self.key_gap_px < 0:
             raise ValueError("key_gap_px 必须非负")
+        if self.layout_units not in ("pixels", "degrees"):
+            raise ValueError("layout_units 必须为 pixels 或 degrees")
+        if not math.isfinite(self.key_size_deg) or not 0 < self.key_size_deg < 90:
+            raise ValueError("key_size_deg 必须在0和90度之间")
+        if not math.isfinite(self.key_gap_deg) or not 0 <= self.key_gap_deg < 90:
+            raise ValueError("key_gap_deg 必须在0和90度之间（可为0）")
+        if self.screen_diagonal_inches is not None and (
+                not math.isfinite(self.screen_diagonal_inches) or self.screen_diagonal_inches <= 0):
+            raise ValueError("screen_diagonal_inches 必须为空或有限正数")
         if not 1 < self.max_gap_factor < 2:
             raise ValueError("max_gap_factor 必须在1和2之间，不得跨明确缺样插值")
         if not (1 < self.frame_long_factor < 2 and 0 < self.frame_short_factor < 1):
@@ -349,9 +238,11 @@ class Config:
             raise ValueError("rate_tolerance 必须在0和0.1之间")
         if not math.isfinite(self.device_timestamp_lag_s):
             raise ValueError("device_timestamp_lag_s 必须有限")
-        for name in ("clock_slew_rate_s_per_s", "quality_clip_tolerance", "quality_jump_z"):
+        for name in ("clock_slew_rate_s_per_s", "quality_rail_margin", "quality_jump_z"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
                 raise ValueError(f"{name} 必须非负且有限")
+        if not math.isfinite(self.quality_max_clip_fraction) or not 0 <= self.quality_max_clip_fraction < 1:
+            raise ValueError("quality_max_clip_fraction 必须是[0, 1)内的有限样本比例")
         if not self.hard_gap_factor > self.max_gap_factor:
             raise ValueError("hard_gap_factor 必须大于 max_gap_factor")
         for name in ("max_warning_gaps", "max_warning_frame_anomalies", "max_warning_bad_channels"):
@@ -369,12 +260,16 @@ class Config:
         if ((self.quality_rail_min is None) != (self.quality_rail_max is None)
                 or (self.quality_rail_min is not None and self.quality_rail_min >= self.quality_rail_max)):
             raise ValueError("quality_rail_min/max 必须同时设置且 min < max")
+        if (self.quality_rail_min is not None
+                and 2 * self.quality_rail_margin >= self.quality_rail_max - self.quality_rail_min):
+            raise ValueError("quality_rail_margin 必须小于设备轨值跨度的一半")
         for name in ("rejection_min_score", "rejection_min_margin"):
             value = getattr(self, name)
             if value is not None and (not math.isfinite(value) or value < 0):
                 raise ValueError(f"{name} 必须非负且有限")
         band_high = max(high for _, high in self.filter_bands)
         _validate_fs(self.target_fs, band_high)
+        _validate_line_regression_hz(self.line_regression_hz, self.target_fs)
         if self.filter_bank_profile == "line_robust" and self.n_harmonics != 3:
             raise ValueError("line_robust 复测方案必须使用 n_harmonics=3")
         _normalise_channel_indices(self.channel_indices)
@@ -432,15 +327,16 @@ LINE_ROBUST_BANDS = tuple((float(8 * n - 2), 48.0) for n in range(1, 4))
 DEFAULT_WINDOW_S = 2.0
 TARGET_FS = 250.0
 N_HARMONICS = 5
-EEG_CHANNEL_INDICES = np.asarray(CONFIG.channel_indices, dtype=int)
 LAST_SESSION: Optional[dict[str, Any]] = None
 
 
 class InvalidTrial(RuntimeError):
     """数据/时序未通过质量检查；必须计入无效试次，而不是静默跳过。"""
-    def __init__(self, message: str, *, epoch: Optional["Epoch"] = None):
+    def __init__(self, message: str, *, epoch: Optional["Epoch"] = None,
+                 code: str = "ACQUISITION"):
         super().__init__(message)
         self.epoch = epoch
+        self.code = code
 
 
 class DegenerateSignalError(ValueError):
@@ -456,8 +352,8 @@ class PauseSelection(RuntimeError):
 
 
 # ======================== 原算法核心 + 数值修正 ========================
-def _normalise_channel_indices(channel_indices: Optional[Sequence[int]]) -> np.ndarray:
-    indices = EEG_CHANNEL_INDICES if channel_indices is None else np.asarray(channel_indices)
+def _normalise_channel_indices(channel_indices: Sequence[int]) -> np.ndarray:
+    indices = np.asarray(channel_indices)
     if indices.ndim != 1 or indices.size == 0:
         raise ValueError("channel_indices 必须是一维非空数组")
     if not np.issubdtype(indices.dtype, np.integer):
@@ -518,6 +414,15 @@ def _validate_harmonics(n: int, frequencies: np.ndarray, fs: float) -> None:
         raise ValueError("最高参考谐波必须低于Nyquist频率")
 
 
+def _validate_line_regression_hz(value: Optional[float], fs: float) -> None:
+    if value is None:
+        return
+    if (isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, float, np.integer, np.floating))
+            or not np.isfinite(value) or not 0 < value < fs / 2):
+        raise ValueError("line_regression_hz须为None或低于Nyquist频率的有限正数")
+
+
 def generate_reference_signals(frequencies_hz: Sequence[float], fs: float,
                                n_samples: int, n_harmonics: int = 5) -> np.ndarray:
     """原参考信号公式；返回(targets, 2*harmonics, samples)。"""
@@ -555,18 +460,24 @@ def _normalised_rows(data: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def assess_signal_quality(data: np.ndarray, *, unit: str = "UNKNOWN",
-                          max_abs: Optional[float] = None,
-                          rail_min: Optional[float] = None,
-                          rail_max: Optional[float] = None,
-                          clip_tolerance: float = 0.0,
-                          jump_z: float = 12.0,
+                           max_abs: Optional[float] = None,
+                           rail_min: Optional[float] = None,
+                           rail_max: Optional[float] = None,
+                           rail_margin: float = 0.0,
+                           max_clip_fraction: float = 0.0,
+                           jump_z: float = 12.0,
                           min_valid_channels: int = 6,
                           max_warning_bad_channels: int = 2) -> dict[str, Any]:
     """检查标准化前的原始 EEG，不改变 FBCCA 的输入和公式。
 
     绝对幅值和削顶只有在设备单位/轨值明确时才有物理意义；未知单位只产生
     警告，避免把任意 LSL 数值误当成微伏或伏特。返回的摘要可直接写入试次日志。
+    rail_margin 使用与输入/轨值相同的数值单位；max_clip_fraction 是[0, 1)样本比例。
     """
+    if not math.isfinite(rail_margin) or rail_margin < 0:
+        raise ValueError("rail_margin 必须是非负有限的EEG数值余量")
+    if not math.isfinite(max_clip_fraction) or not 0 <= max_clip_fraction < 1:
+        raise ValueError("max_clip_fraction 必须是[0, 1)内的有限样本比例")
     try:
         x = _validate_eeg_ct(data, name="原始EEG")
     except ValueError as exc:
@@ -618,14 +529,15 @@ def assess_signal_quality(data: np.ndarray, *, unit: str = "UNKNOWN",
         if (rail_min is None or rail_max is None or not rail_min < rail_max
                 or not np.isfinite(rail_min) or not np.isfinite(rail_max)):
             raise ValueError("rail_min/rail_max 必须同时为有限值且 min < max")
-        tol = max(0.0, float(clip_tolerance))
-        clipped = (x <= rail_min + tol) | (x >= rail_max - tol)
+        if 2 * rail_margin >= rail_max - rail_min:
+            raise ValueError("rail_margin 必须小于设备轨值跨度的一半")
+        clipped = (x <= rail_min + rail_margin) | (x >= rail_max - rail_margin)
         clip_fraction = clipped.mean(axis=1)
-        if np.any(clip_fraction > tol):
+        if np.any(clip_fraction > max_clip_fraction):
             report["hard_fail"] = True
             report["hard_reasons"].append(
                 "检测到设备轨值削顶通道: " + ",".join(
-                    str(i + 1) for i in np.flatnonzero(clip_fraction > tol)))
+                    str(i + 1) for i in np.flatnonzero(clip_fraction > max_clip_fraction)))
     elif max_abs is None:
         report["warnings"].append("单位或设备满量程阈值未配置，绝对幅值/削顶仅记录未门控")
     report["clip_fraction"] = clip_fraction.tolist()
@@ -776,28 +688,35 @@ def fbcca_fusion(eeg_subbands: np.ndarray, reference_signals: np.ndarray,
     return weights @ (correlations ** 2), correlations, weights
 
 
-def preprocess_lsl_window(data_ch_samples: np.ndarray, fs: float,
-                          window_s: float = DEFAULT_WINDOW_S, onset_s: float = 0.0,
-                          target_fs: float = TARGET_FS, notch_hz: Optional[float] = 50.0,
-                          *, filter_bands: Optional[Sequence[Sequence[float]]] = None
-                          ) -> tuple[np.ndarray, np.ndarray]:
-    """保留原 Chebyshev-I 阶数4/纹波0.5dB和filtfilt；不是连续因果滤波。
-
-    输入为均匀时间网格。onset_s仅为数组裁剪偏移；事件截窗后必须传0。
-    零相位滤波只使用已到齐的本窗口及SciPy默认反射边界，未引入后续试次。
-    """
-    from scipy.signal import cheby1, filtfilt, iirnotch, resample_poly, sosfiltfilt
-    bands = _validate_filter_bands(filter_bands, fs, target_fs)
-    data = _validate_eeg_ct(data_ch_samples, name="LSL数据")
-    if not np.isfinite(data).all():
-        raise ValueError("LSL数据须为有限(channels, samples)数组")
+def _slice_eeg_window(data: np.ndarray, fs: float, window_s: float,
+                      onset_s: float, *, short_message: str) -> np.ndarray:
+    """Select one complete EEG window after the caller has checked layout and sampling rate."""
     if not np.isfinite(window_s) or window_s <= 0 or not np.isfinite(onset_s) or onset_s < 0:
         raise ValueError("window_s须为正、onset_s须非负")
     start, length = round(onset_s * fs), sample_count(window_s, fs)
     if length < 32 or start + length > data.shape[1]:
-        raise ValueError("数据不足或窗口过短；不得补零凑齐窗口")
-    window = data[:, start:start + length].copy()
-    _normalised_rows(window)  # 对原始退化输入显式报错。
+        raise ValueError(short_message)
+    return data[:, start:start + length].copy()
+
+
+def _regress_line_noise(window: np.ndarray, fs: float, line_hz: float) -> np.ndarray:
+    """仅使用当前窗拟合常数/正弦/余弦，减去正弦和余弦；与离线冻结方案一致。"""
+    x = window.copy()
+    t = np.arange(x.shape[-1]) / fs
+    design = np.column_stack((np.ones(t.size), np.sin(2*np.pi*line_hz*t),
+                              np.cos(2*np.pi*line_hz*t)))
+    coefficients = np.linalg.lstsq(design, x.T, rcond=None)[0]
+    x -= (design[:, 1:] @ coefficients[1:]).T
+    return x
+
+
+def _preprocess_validated_window(window: np.ndarray, fs: float, window_s: float,
+                                 target_fs: float, notch_hz: Optional[float],
+                                 bands: tuple[tuple[float, float], ...]
+                                 ) -> tuple[np.ndarray, np.ndarray]:
+    """Filter a sliced, checked window; the public entry points validate it once."""
+    from scipy.signal import cheby1, filtfilt, iirnotch, resample_poly, sosfiltfilt
+
     if not math.isclose(fs, target_fs, rel_tol=0, abs_tol=1e-9):
         ratio = Fraction(target_fs / fs).limit_denominator(100000)
         actual_fs = fs * ratio.numerator / ratio.denominator
@@ -818,13 +737,34 @@ def preprocess_lsl_window(data_ch_samples: np.ndarray, fs: float,
     return window, np.stack(bank)
 
 
+def preprocess_lsl_window(data_ch_samples: np.ndarray, fs: float,
+                          window_s: float = DEFAULT_WINDOW_S, onset_s: float = 0.0,
+                          target_fs: float = TARGET_FS, notch_hz: Optional[float] = 50.0,
+                          *, filter_bands: Optional[Sequence[Sequence[float]]] = None
+                          ) -> tuple[np.ndarray, np.ndarray]:
+    """保留原 Chebyshev-I 阶数4/纹波0.5dB和filtfilt；不是连续因果滤波。
+
+    输入为均匀时间网格。onset_s仅为数组裁剪偏移；事件截窗后必须传0。
+    零相位滤波只使用已到齐的本窗口及SciPy默认反射边界，未引入后续试次。
+    """
+    bands = _validate_filter_bands(filter_bands, fs, target_fs)
+    data = _validate_eeg_ct(data_ch_samples, name="LSL数据")
+    if not np.isfinite(data).all():
+        raise ValueError("LSL数据须为有限(channels, samples)数组")
+    window = _slice_eeg_window(data, fs, window_s, onset_s,
+                               short_message="数据不足或窗口过短；不得补零凑齐窗口")
+    _normalised_rows(window)  # 对原始退化输入显式报错。
+    return _preprocess_validated_window(window, fs, window_s, target_fs, notch_hz, bands)
+
+
 def classify_eeg_window(data_ch_samples: np.ndarray, fs: float,
                         window_s: float = DEFAULT_WINDOW_S, onset_s: float = 0.0,
                         target_frequencies_hz: Optional[Sequence[float]] = None,
                         n_harmonics: int = N_HARMONICS, *, target_fs: float = TARGET_FS,
                         notch_hz: Optional[float] = 50.0, a: float = 1.25, b: float = .25,
                         regularization: float = 1e-10, min_valid_channels: int = 1,
-                        filter_bands: Optional[Sequence[Sequence[float]]] = None) -> dict:
+                        filter_bands: Optional[Sequence[Sequence[float]]] = None,
+                        line_regression_hz: Optional[float] = None) -> dict:
     """只接收EEG/算法参数，不接受真实目标，防止标签泄漏。
 
     FBCCA和标准CCA共享完全相同的EEG窗、通道、参考和第一子带。
@@ -834,20 +774,21 @@ def classify_eeg_window(data_ch_samples: np.ndarray, fs: float,
                    else np.asarray(target_frequencies_hz, float))
     bands = _validate_filter_bands(filter_bands, fs, target_fs)
     _validate_harmonics(n_harmonics, frequencies, fs)
+    _validate_line_regression_hz(line_regression_hz, min(fs, target_fs))
     data = _validate_eeg_ct(data_ch_samples, name="EEG")
     if not np.isfinite(window_s) or window_s <= 0 or not np.isfinite(onset_s) or onset_s < 0:
         raise ValueError("EEG须二维，窗长为正，偏移非负")
-    start, length = round(onset_s * fs), sample_count(window_s, fs)
-    if length < 32 or start + length > data.shape[1]:
-        raise ValueError("EEG时间窗覆盖不足")
-    normalized, active = _normalised_rows(data[:, start:start + length])
+    window = _slice_eeg_window(data, fs, window_s, onset_s,
+                               short_message="EEG时间窗覆盖不足")
+    if line_regression_hz is not None:
+        window = _regress_line_noise(window, fs, line_regression_hz)
+    normalized, active = _normalised_rows(window)
     if isinstance(min_valid_channels, bool) or not isinstance(min_valid_channels, int) or min_valid_channels < 1:
         raise ValueError("min_valid_channels须为正整数")
     if len(active) < min_valid_channels:
         raise DegenerateSignalError(f"有效变化通道仅{len(active)}个，至少需要{min_valid_channels}个")
     # 输入窗口已裁好，后续不再重复裁剪或加140ms。单位标准化先于滤波。
-    window, bank = preprocess_lsl_window(normalized, fs, window_s, 0.0, target_fs, notch_hz,
-                                         filter_bands=bands)
+    window, bank = _preprocess_validated_window(normalized, fs, window_s, target_fs, notch_hz, bands)
     refs = generate_reference_signals(frequencies, target_fs, window.shape[-1], n_harmonics)
     scores, rho, weights = fbcca_fusion(bank, refs, a, b, regularization)
     best = int(np.argmax(scores))
@@ -863,6 +804,7 @@ def classify_eeg_window(data_ch_samples: np.ndarray, fs: float,
         "processing_fs": target_fs,
         "filter_bands_hz": bands,
         "n_harmonics": n_harmonics,
+        "line_regression_hz": line_regression_hz,
     }
 
 
@@ -871,8 +813,6 @@ def classify_eeg_window(data_ch_samples: np.ndarray, fs: float,
 class Epoch:
     data: np.ndarray
     fs: float
-    requested_start: float
-    requested_end: float
     raw_timestamps: np.ndarray
     local_timestamps: np.ndarray
     clock_corrections: np.ndarray
@@ -1037,6 +977,20 @@ class TimestampBuffer:
                       self.local_ts[indices].copy(), self.corrections[indices].copy(), self.valid[indices].copy())
             return result + (self.source_ts[indices].copy(),) if include_source else result
 
+    def window_snapshot(self, start: float, end: float) -> tuple[np.ndarray, ...]:
+        """Copy only the samples that support interpolation over [start, end]."""
+        with self.lock:
+            indices = (self.cursor - self.size + np.arange(self.size)) % self.capacity
+            local = self.local_ts[indices]
+            if len(local) < 2 or local[0] > start or local[-1] < end:
+                raise InvalidTrial("事件窗口数据未到齐或已被缓冲覆盖")
+            left = int(np.searchsorted(local, start, side="right") - 1)
+            right = int(np.searchsorted(local, end, side="left"))
+            selected = indices[left:right + 1]
+            return (self.samples[:, selected].copy(), self.raw_ts[selected].copy(),
+                    local[left:right + 1].copy(), self.corrections[selected].copy(),
+                    self.valid[selected].copy(), self.source_ts[selected].copy())
+
     def epoch(self, start: float, duration_s: float, nominal_fs: float,
               max_gap_factor: float = 1.5, rate_tolerance: float = .02,
               hard_gap_factor: float = 2.0, hard_rate_tolerance: float = .05,
@@ -1045,24 +999,16 @@ class TimestampBuffer:
         if not np.isfinite(start) or not np.isfinite(duration_s) or duration_s <= 0:
             raise ValueError("事件时间/窗口长度不合法")
         end = start + duration_s
-        x, raw, local, corrections, valid, source = self.snapshot(include_source=True)
         # 需要两侧插值支撑且至少到完整窗口终点；绝不使用np.interp的端点外推。
-        if len(local) < 2 or local[0] > start or local[-1] < end:
-            raise InvalidTrial("事件窗口数据未到齐或已被缓冲覆盖")
-        left = int(np.searchsorted(local, start, side="right") - 1)
-        right = int(np.searchsorted(local, end, side="left"))
-        x = x[:, left:right + 1]
-        raw = raw[left:right + 1]
-        source = source[left:right + 1]
-        local = local[left:right + 1]
-        corrections = corrections[left:right + 1]
-        valid = valid[left:right + 1]
+        x, raw, local, corrections, valid, source = self.window_snapshot(start, end)
         def failure_epoch(message: str) -> Epoch:
             return Epoch(
-                np.empty((self.n_channels, 0), dtype=float), nominal_fs, start, end,
-                raw.copy(), local.copy(), corrections.copy(),
-                {"hard_reason": message, "timestamp_mode": self.timestamp_mode},
-                x.copy(), np.empty(0, dtype=float), source.copy())
+                data=np.empty((self.n_channels, 0), dtype=float), fs=nominal_fs,
+                raw_timestamps=raw.copy(), local_timestamps=local.copy(),
+                clock_corrections=corrections.copy(),
+                diagnostics={"hard_reason": message, "timestamp_mode": self.timestamp_mode},
+                source_data=x.copy(), uniform_timestamps=np.empty(0, dtype=float),
+                source_timestamps=source.copy())
         if len(local) < 3 or not np.all(valid):
             message = "窗口含NaN/Inf或有效样本不足"
             raise InvalidTrial(message, epoch=failure_epoch(message))
@@ -1103,7 +1049,8 @@ class TimestampBuffer:
         # 将已检查的源分析时轴对齐到统一网格；OpenBCI的逐点丢样仍未核验。
         # 保留高原始采样率后交给resample_poly抗混叠降采样，不能直接插值到250 Hz。
         uniform = np.asarray([np.interp(grid, local, channel) for channel in x], dtype=float)
-        return Epoch(uniform, nominal_fs, start, end, raw.copy(), local.copy(), corrections.copy(), {
+        return Epoch(data=uniform, fs=nominal_fs, raw_timestamps=raw.copy(),
+                     local_timestamps=local.copy(), clock_corrections=corrections.copy(), diagnostics={
             "source_support_samples": len(local), "uniform_samples": len(grid),
             "timestamp_estimated_fs": float(measured_fs), "source_clock_estimated_fs": float(source_measured_fs),
             "max_source_interval_s": float(dt_source.max()), "max_local_interval_s": float(dt_local.max()),
@@ -1120,7 +1067,7 @@ class TimestampBuffer:
                               "timestamp-grid alignment only; gaps validated; no extrapolation"),
             "warnings": warnings,
             "warning_gap_count": int(np.count_nonzero(gap_mask)),
-        }, x.copy(), grid.copy(), source.copy())
+        }, source_data=x.copy(), uniform_timestamps=grid.copy(), source_timestamps=source.copy())
 
 
 def _parse_stream_metadata(info: Any, indices: Sequence[int]) -> dict:
@@ -1289,10 +1236,9 @@ class OpenBCISampleClock:
 class ClockCorrectionState:
     """将LSL校正平滑应用到后续源时间轴（兼容模式下为重建轴），不回写历史。"""
     observed: float
-    target: float
     applied: float
     slew_rate_s_per_s: float
-    last_raw: Optional[float] = None
+    last_source: Optional[float] = None
 
     def observe(self, value: float, max_step_s: float) -> None:
         value = float(value)
@@ -1305,27 +1251,26 @@ class ClockCorrectionState:
                 f"previous={self.observed:.9f}s, current={value:.9f}s, "
                 f"step={step:.9f}s, limit={max_step_s:.9f}s")
         self.observed = value
-        self.target = value
 
-    def apply(self, raw_timestamps: np.ndarray) -> np.ndarray:
-        raw = np.asarray(raw_timestamps, dtype=float)
-        if raw.ndim != 1 or not len(raw) or not np.isfinite(raw).all():
-            raise InvalidTrial("原始时间戳非有限或为空")
-        if np.any(np.diff(raw) <= 0) or (self.last_raw is not None and raw[0] <= self.last_raw):
-            raise InvalidTrial("原始时间戳倒序/重复，拒绝构造校正时间轴")
+    def apply(self, source_timestamps: np.ndarray) -> np.ndarray:
+        source = np.asarray(source_timestamps, dtype=float)
+        if source.ndim != 1 or not len(source) or not np.isfinite(source).all():
+            raise InvalidTrial("源时间戳非有限或为空")
+        if np.any(np.diff(source) <= 0) or (self.last_source is not None and source[0] <= self.last_source):
+            raise InvalidTrial("源时间戳倒序/重复，拒绝构造校正时间轴")
         current = float(self.applied)
-        previous = self.last_raw
-        applied = np.empty(len(raw), dtype=float)
-        for i, timestamp in enumerate(raw):
+        previous = self.last_source
+        applied = np.empty(len(source), dtype=float)
+        for i, timestamp in enumerate(source):
             dt = 1.0 / 250.0 if previous is None else float(timestamp - previous)
             if dt <= 0 or not np.isfinite(dt):
-                raise InvalidTrial("原始时间戳间隔非法")
+                raise InvalidTrial("源时间戳间隔非法")
             max_change = max(0.0, float(self.slew_rate_s_per_s)) * dt
-            current += float(np.clip(self.target - current, -max_change, max_change))
+            current += float(np.clip(self.observed - current, -max_change, max_change))
             applied[i] = current
             previous = float(timestamp)
         self.applied = current
-        self.last_raw = float(raw[-1])
+        self.last_source = float(source[-1])
         return applied
 
 
@@ -1372,8 +1317,8 @@ class ContinuousLSL:
     def start(self) -> None:
         try:
             import pylsl
-        except (ImportError, RuntimeError) as exc:
-            raise RuntimeError("不能加载pylsl/liblsl。先安装pylsl；Linux还需可加载的liblsl。见README。") from exc
+        except (ImportError, RuntimeError, OSError) as exc:
+            raise RuntimeFault("LSL_LIBRARY", "不能加载pylsl/liblsl：" + str(exc)) from exc
         self.clock = pylsl.local_clock
         prop = ("name", self.cfg.eeg_stream_name) if self.cfg.eeg_stream_name else ("type", self.cfg.eeg_stream_type)
         # OpenBCI 通常只发布一条 EEG 流；minimum=2 会让 pylsl 在单流时
@@ -1389,7 +1334,7 @@ class ContinuousLSL:
                 f"fs={stream.nominal_srate():g}Hz)"
                 for stream in visible
             ) or "无"
-            raise RuntimeError(
+            raise RuntimeFault("LSL_NOT_FOUND",
                 f"未找到LSL流 {prop}。当前可见流：{details}\n"
                 "设备连接成功不代表已开启LSL输出。本程序通过LSL接收EEG，不直接连接USB设备。\n"
                 "若使用OpenBCI GUI：先Start Data Stream，再在Networking选择LSL，"
@@ -1397,7 +1342,7 @@ class ContinuousLSL:
             )
         if len(streams) != 1:
             names = ", ".join(repr(stream.name()) for stream in streams)
-            raise RuntimeError(
+            raise RuntimeFault("LSL_CONNECTION",
                 f"找到多个匹配的EEG流（{names}），请在CONFIG.eeg_stream_name填写唯一名称"
             )
         # 保留原始时间戳并手动+time_correction恰好一次；不启用clocksync/monotonize/dejitter。
@@ -1427,7 +1372,7 @@ class ContinuousLSL:
             self.inlet.open_stream(timeout=self.cfg.connect_timeout_s)
             correction = float(self.inlet.time_correction(timeout=self.cfg.connect_timeout_s))
             self.clock_updates.append({"local_time": self.clock(), "observed": correction,
-                                       "target": correction, "applied": correction})
+                                       "applied": correction})
             self.buffer = TimestampBuffer(math.ceil(self.cfg.buffer_s * self.fs * 1.05),
                                           len(self.cfg.channel_indices), self.timestamp_mode)
             self.thread = threading.Thread(target=self._run, args=(correction,), name="EEG-LSL-collector", daemon=True)
@@ -1447,7 +1392,7 @@ class ContinuousLSL:
                 startup_error = abs(self.estimated_fs / self.fs - 1)
                 raw_startup_error = abs(raw_estimated_fs / self.fs - 1)
                 if max(startup_error, raw_startup_error) > self.cfg.hard_rate_tolerance:
-                    raise RuntimeError(
+                    raise RuntimeFault("ACQUISITION",
                         f"启动实测时间戳速率不符：raw={raw_estimated_fs:.3f}Hz, "
                         f"local={self.estimated_fs:.3f}Hz, declared={self.fs:g}Hz")
                 if max(startup_error, raw_startup_error) > self.cfg.rate_tolerance:
@@ -1456,12 +1401,36 @@ class ContinuousLSL:
                 _validate_fs(self.estimated_fs, max(high for _, high in self.cfg.filter_bands))
                 return
             self.stop_event.wait(.02)
-        raise RuntimeError("启动阶段未收到足够的连续EEG数据")
+        raise RuntimeFault("ACQUISITION", "已找到LSL流，但启动阶段未收到足够的连续EEG数据")
+
+    def _recover_sample_clock(self, exc: InvalidTrial, incoming_ts: np.ndarray,
+                              correction_state: ClockCorrectionState) -> None:
+        """Discard the anomalous chunk and publish a new recovery generation."""
+        assert self.buffer is not None and self.sample_clock is not None
+        event = {
+            "local_time": float(self.clock()),
+            "reason": str(exc),
+            "discarded_chunk_samples": len(incoming_ts),
+            "first_raw_timestamp": float(incoming_ts[0]),
+            "last_raw_timestamp": float(incoming_ts[-1]),
+            "previous_raw_timestamp": self.sample_clock.last_raw,
+            "previous_clock_summary": self.sample_clock.summary(),
+        }
+        with self.recovery_lock:
+            # Publish the reset and generation together. A trial cannot mistake
+            # the old ready clock for the new one.
+            self.buffer.clear()
+            self.sample_clock = self._new_sample_clock()
+            correction_state.last_source = None
+            self.recovery_events.append(event)
+        self.metadata["timestamp_processing"] = self._timestamp_summary()
+        print(f"[时间轴恢复] 异常批次已丢弃（{len(incoming_ts)}样本）：{exc}；"
+              "当前试次无效，等待重新稳定后重试。", flush=True)
 
     def _run(self, correction: float) -> None:
         assert self.inlet is not None and self.buffer is not None
         correction_state = ClockCorrectionState(
-            observed=float(correction), target=float(correction), applied=float(correction),
+            observed=float(correction), applied=float(correction),
             slew_rate_s_per_s=self.cfg.clock_slew_rate_s_per_s)
 
         next_clock_update = time.monotonic() + self.cfg.clock_refresh_s
@@ -1475,7 +1444,7 @@ class ContinuousLSL:
                     correction_state.observe(new_correction, self.cfg.max_clock_step_s)
                     self.clock_updates.append({
                         "local_time": self.clock(), "observed": correction_state.observed,
-                        "target": correction_state.target, "applied": correction_state.applied,
+                        "applied": correction_state.applied,
                     })
                     next_clock_update = time.monotonic() + self.cfg.clock_refresh_s
 
@@ -1500,25 +1469,7 @@ class ContinuousLSL:
                 except InvalidTrial as exc:
                     if not (self.sample_clock and self.cfg.continue_on_timestamp_anomaly):
                         raise
-                    event = {
-                        "local_time": float(self.clock()),
-                        "reason": str(exc),
-                        "discarded_chunk_samples": len(incoming_ts),
-                        "first_raw_timestamp": float(incoming_ts[0]),
-                        "last_raw_timestamp": float(incoming_ts[-1]),
-                        "previous_raw_timestamp": self.sample_clock.last_raw,
-                        "previous_clock_summary": self.sample_clock.summary(),
-                    }
-                    with self.recovery_lock:
-                        # Publish the reset and generation together. A trial
-                        # cannot mistake the old ready clock for the new one.
-                        self.buffer.clear()
-                        self.sample_clock = self._new_sample_clock()
-                        correction_state.last_raw = None
-                        self.recovery_events.append(event)
-                    self.metadata["timestamp_processing"] = self._timestamp_summary()
-                    print(f"[时间轴恢复] 异常批次已丢弃（{len(incoming_ts)}样本）：{exc}；"
-                          "当前试次无效，等待重新稳定后重试。", flush=True)
+                    self._recover_sample_clock(exc, incoming_ts, correction_state)
                     continue
                 if self.sample_clock:
                     self.metadata["timestamp_processing"] = self._timestamp_summary()
@@ -1543,9 +1494,9 @@ class ContinuousLSL:
 
     def check_health(self) -> None:
         if self.error is not None:
-            raise InvalidTrial(f"采集线程异常：{self.error}") from self.error
+            raise RuntimeFault("ACQUISITION", f"采集线程异常：{self.error}") from self.error
         if self.stop_event.is_set():
-            raise InvalidTrial("采集已停止")
+            raise RuntimeFault("ACQUISITION", "采集已停止")
 
     def wait_epoch(self, onset: float, cancel: threading.Event) -> Epoch:
         assert self.buffer is not None
@@ -1590,7 +1541,8 @@ def decode_trial(trial_id: int, onset: float, collector: ContinuousLSL, cfg: Con
     quality = assess_signal_quality(
         epoch.source_data, unit=quality_unit, max_abs=cfg.quality_max_abs,
         rail_min=cfg.quality_rail_min, rail_max=cfg.quality_rail_max,
-        clip_tolerance=cfg.quality_clip_tolerance, jump_z=cfg.quality_jump_z,
+        rail_margin=cfg.quality_rail_margin,
+        max_clip_fraction=cfg.quality_max_clip_fraction, jump_z=cfg.quality_jump_z,
         min_valid_channels=cfg.min_valid_channels,
         max_warning_bad_channels=cfg.max_warning_bad_channels)
     quality["mains_noise"] = mains_noise_diagnostics(epoch.data, epoch.fs, cfg.notch_hz)
@@ -1606,7 +1558,7 @@ def decode_trial(trial_id: int, onset: float, collector: ContinuousLSL, cfg: Con
             target_frequencies_hz=BENCHMARK_FREQUENCIES_HZ, n_harmonics=cfg.n_harmonics,
             target_fs=cfg.target_fs, notch_hz=cfg.notch_hz, a=cfg.weight_a, b=cfg.weight_b,
             regularization=cfg.cca_regularization, min_valid_channels=cfg.min_valid_channels,
-            filter_bands=cfg.filter_bands)
+            filter_bands=cfg.filter_bands, line_regression_hz=cfg.line_regression_hz)
     result.update(trial_id=trial_id, epoch=epoch, quality=quality,
                   computation_s=time.monotonic() - started)
     return result
@@ -1812,8 +1764,8 @@ def spectral_quality(data: np.ndarray, fs: float, target_id: Optional[int],
 
 
 class SessionRecorder:
-    """逐试次原子保存 JSON 元数据和 NPZ 数组，避免自由输入退出时丢失 EEG。"""
-    schema_version = 2
+    """逐试次原子保存 JSON 元数据和 NPZ 数组；分数与 EEG 只存于 NPZ。"""
+    schema_version = 3
 
     def __init__(self, cfg: Config, *, root: Optional[str | Path] = None,
                  context: Optional[dict[str, Any]] = None):
@@ -1830,11 +1782,12 @@ class SessionRecorder:
         self.export_artifacts: dict[str, str] = {}
         self._records: list[TrialRecord] = []
         self.program = {
-            "program_version": "dual-mode-export-1", "export_schema_version": 1,
+            "program_version": "dual-mode-auto-cued-3", "export_schema_version": 2,
             "record_schema_version": self.schema_version,
             "source_file": Path(__file__).name,
             "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             "python_version": sys.version, "numpy_version": np.__version__,
+            "runtime_environment": environment_snapshot(),
         }
         self.manifest: dict[str, Any] = {
             "schema_version": self.schema_version,
@@ -1922,6 +1875,7 @@ class SessionRecorder:
             "start": record.start, "end": record.end,
             "duration_s": max(0.0, record.end - record.start),
             "cue_onset": record.cue_onset,
+            "cue_progression": "automatic_timed" if record.mode == "cued" else None,
             "cue_confirmed_at": record.cue_confirmed_at, "fixation_onset": record.fixation_onset,
             "stimulus_onset": record.stimulus_onset,
             "stimulus_offset": record.stimulus_offset,
@@ -1934,18 +1888,17 @@ class SessionRecorder:
             "frequency_hz": result.get("frequency_hz"),
             "filter_bands_hz": result.get("filter_bands_hz"),
             "n_harmonics": result.get("n_harmonics"),
-            "scores": result.get("scores"),
+            "line_regression_hz": result.get("line_regression_hz", self.cfg.line_regression_hz),
             "rejection_diagnostics": result.get("rejection_diagnostics"),
             "cca_prediction": result.get("cca_prediction"),
             "cca_frequency_hz": result.get("cca_frequency_hz"),
-            "cca_scores": result.get("cca_scores"),
-            "correlations": result.get("correlations"),
             "computation_s": result.get("computation_s"),
             "quality": result.get("quality"),
             "sampling_rate_hz": epoch.fs if epoch is not None else None,
             "epoch_diagnostics": epoch.diagnostics if epoch is not None else None,
             "artifact_refs": record.artifact_refs,
             "arrays_file": arrays_path.name,
+            "array_keys": sorted(arrays),
         }
         self._atomic_json(metadata_path, trial_metadata)
         entry = {"trial_id": record.trial_id, "status": record.status,
@@ -2035,7 +1988,8 @@ class SessionRecorder:
             "config": vars(self.cfg), "summary": summary,
             "decoder_settings": {"filter_bank_profile": self.cfg.filter_bank_profile,
                                  "filter_bands_hz": self.cfg.filter_bands,
-                                 "n_harmonics": self.cfg.n_harmonics},
+                                 "n_harmonics": self.cfg.n_harmonics,
+                                 "line_regression_hz": self.cfg.line_regression_hz},
             "events": events, "acquisition_metadata": acquisition_metadata,
             "acquisition_review": acquisition_review, "clock_updates": clock_updates,
             "display_info": display_info, "typed_text": typed_text,
@@ -2114,7 +2068,8 @@ def make_luminance_table(refresh_hz: float, duration_s: float) -> np.ndarray:
         raise ValueError("刷新率无法支持当前最高刺激频率")
     if not np.isfinite(duration_s) or duration_s <= 0:
         raise ValueError("刺激时长必须为正")
-    frames = max(1, round(duration_s * refresh_hz))
+    # 向上取整并留一帧余量；运行时仍以实际翻转时间检查分析窗边界。
+    frames = max(1, math.ceil(duration_s * refresh_hz) + 1)
     t = np.arange(frames)[:, None] / refresh_hz
     phases = np.array([target.phase_rad for target in TARGETS])[None, :]
     return .5 * (1 + np.sin(2 * np.pi * t * BENCHMARK_FREQUENCIES_HZ[None, :] + phases))
@@ -2180,46 +2135,14 @@ def _pct(value: Optional[float]) -> str:
     return "N/A" if value is None else f"{100 * value:.2f}%"
 
 
+def _brief_reason(reason: str, limit: int = 160) -> str:
+    message = " ".join(reason.split())
+    return message if len(message) <= limit else message[:limit - 1] + "…"
+
+
 def print_summary(report: dict, ledger: TrialLedger) -> None:
-    if not ledger.records:
-        print("尚未开始试次，请先处理上方的结束原因。", flush=True)
-        return
-    print("\n" + "=" * 76)
-    print("提示式40分类结果（非自由输入；JSON/NPZ记录已保存）")
-    print(f"计划{report['planned']}个目标试次 | 已完成目标{report['completed_targets']} | "
-          f"尝试{report['attempted']}次 | 有效{report['valid']} | "
-          f"拒识{report.get('rejected', 0)} | 无效/中止{report['invalid_or_aborted']} | 未开始{report['not_started']}")
-    mean_time = report['mean_actual_selection_s']
-    if mean_time is not None:
-        print(f"实际每次选择平均{mean_time:.3f}s，包含提示、刺激、等待、计算、空白和反馈。")
-        print(f"试次内总时间{report['active_selection_s']:.3f}s；含区块休息/试次间开销墙钟{report['wall_s_including_breaks']:.3f}s。")
-    for name in ("fbcca", "cca"):
-        stats = report[name]
-        print(f"{name.upper()}: 正确{stats['correct']} | 有效试次准确率 {_pct(stats['accuracy_valid'])} | "
-              f"全部已开始试次成功率 {_pct(stats['success_all_attempted'])}")
-        if stats['itr_conservative_actual_bpm'] is not None:
-            print(f"  ITR模型估计（无效视为不成功、实际试次耗时）{stats['itr_conservative_actual_bpm']:.3f} bit/min；"
-                  f"含休息{stats['itr_conservative_wall_bpm']:.3f} bit/min")
-    print("\n逐目标：ID  字符    Hz  尝试 有效 无效 FBCCA正确 CCA正确 FBCCA有效准确率")
-    for target in TARGETS:
-        j = target.class_id - 1
-        nv = report['target_valid'][j]
-        correct = report['fbcca_confusion'][j, j]
-        accuracy = correct / nv if nv else None
-        print(f"{target.class_id:02d} {target.symbol:>5} {target.frequency_hz:5.1f} "
-              f"{report['target_attempts'][j]:4d} {nv:4d} {report['target_invalid'][j]:4d} "
-              f"{correct:9d} {report['cca_confusion'][j,j]:7d} {_pct(accuracy):>12}")
-    for name in ("fbcca", "cca"):
-        cm = report[f'{name}_confusion']
-        print(f"\n{name.upper()} 错分明细（真实ID -> 预测ID: 次数）：")
-        errors = [(i, j, cm[i, j]) for i in range(len(TARGETS)) for j in range(len(TARGETS)) if i != j and cm[i, j]]
-        print("; ".join(f"{i+1:02d}->{j+1:02d}: {count}" for i, j, count in errors) or "没有已记录的有效试次错分。")
-    invalid = [r for r in ledger.records if r.status != "valid"]
-    for r in invalid:
-        true_label = "--" if r.true_class is None else f"{r.true_class:02d}"
-        print(f"无效/拒识/中止 trial={r.trial_id} true={true_label}: {r.reason}")
-    print(f"\n键盘输出：{ledger.typed_text!r}")
-    print("完整混淆矩阵、逐帧时间、事件、每窗EEG/时间戳和分数已写入会话记录目录。")
+    print(f"已完成目标{report['completed_targets']} | 有效试次{report['valid']} | "
+          f"FBCCA准确率 {_pct(report['fbcca']['accuracy_valid'])}")
 
 
 def summarize_free_trials(records: Sequence[TrialRecord], ledger: TrialLedger) -> dict:
@@ -2228,6 +2151,7 @@ def summarize_free_trials(records: Sequence[TrialRecord], ledger: TrialLedger) -
         raise ValueError("自由输入记录不应含提示目标")
     return {
         "mode": "free", "attempted": len(records),
+        "completed": sum(r.status != "aborted" for r in records),
         "valid": sum(r.status == "valid" for r in records),
         "input_actions": sum(r.text_applied for r in records),
         "rejected": sum(r.status == "rejected" for r in records),
@@ -2238,14 +2162,8 @@ def summarize_free_trials(records: Sequence[TrialRecord], ledger: TrialLedger) -
 
 
 def print_free_summary(report: dict) -> None:
-    print("\n" + "=" * 76)
-    print("自由输入结束（真实LSL EEG；无预设目标；文本仅在本程序中）")
-    print(f"已开始{report['attempted']}轮 | 已执行{report['input_actions']}次输入操作"
-          f"（包括SPACE/BACK） | 拒识{report.get('rejected', 0)}轮 | "
-          f"无效或未完成{report['invalid_or_aborted']}轮")
-    print("最终文本：", repr(report['typed_text']))
-    print("自由输入没有真实目标标签，不计算准确率、混淆矩阵或ITR。")
-    print("自由输入未校准个人模型，也不具备自动空闲检测。离开注视前请先暂停。")
+    print(f"已完成{report['completed']}轮 | 有效{report['valid']}轮 | "
+          "准确率 N/A（自由输入无真实目标）")
 
 
 def output_display_text(text: str, max_chars: int) -> str:
@@ -2338,19 +2256,10 @@ def preflight_review(cfg: Config, collector: ContinuousLSL) -> dict:
     band_high = max(high for _, high in cfg.filter_bands)
     startup_quality = preflight_signal_quality(cfg, collector)
     startup_summary = _preflight_quality_summary(startup_quality)
-    print("启动EEG工频检查（仅提示，不新增门控）：" + startup_summary, flush=True)
-    if startup_quality["available"]:
-        for channel in startup_quality["channels"]:
-            fraction = channel["line_fraction"]
-            value = "N/A" if fraction is None else f"{fraction:.1%}"
-            print(f"  {channel['position']} <- LSL[{channel['lsl_index']}]: {value}", flush=True)
-        if startup_quality["mains_noise"]["line_dominated"]:
-            print("  工频附近占比高，可先检查电极、参考/BIAS接触与采集环境；"
-                  "该比值不等于物理幅度，也不是已验证的拒识阈值。", flush=True)
-    print("工频诊断：逐轮保存接收端陷波/带通前的相对频谱占比（陷波中心±1 Hz / "
-          "6–min(90, Nyquist) Hz，排除Nyquist频点；"
-          "陷波关闭时观察49–51 Hz）。通道中位占比≥50%仅警告，未作为已验证拒识门限；"
-          "不依赖单位，也不推断物理幅值。", flush=True)
+    if not startup_quality["available"]:
+        print("启动EEG工频检查不可用：" + str(startup_quality["unavailable_reason"]), flush=True)
+    elif startup_quality["mains_noise"]["line_dominated"]:
+        print("启动EEG工频占比偏高，请检查电极和采集环境。", flush=True)
     if cfg.quick_entry_mode:
         print("\n=== 快速调试模式：跳过严格EEG启动核验对话框 ===", flush=True)
         print(f"流: {meta.get('name')} | 总通道: {meta.get('channel_count')} | "
@@ -2440,13 +2349,25 @@ def _keyboard_side_margin(width: float) -> float:
     return max(24.0, min(64.0, width * .02))
 
 
-def calculate_keyboard_layout(cfg: Config, window_size: Sequence[float]
-                              ) -> tuple[np.ndarray, float, tuple[float, float], float]:
-    """铺满可用区域，返回中心坐标、方块边长、(列间距, 行间距)、缩放。
+def _display_cm_per_pixel(cfg: Config, window_size: Sequence[float],
+                          display_size: Optional[Sequence[float]] = None) -> Optional[float]:
+    """对角线来自人工填写；窗口模式必须提供整块屏幕的绘制像素尺寸。"""
+    if cfg.screen_diagonal_inches is None:
+        return None
+    if display_size is None:
+        if not cfg.full_screen:
+            raise ValueError("窗口模式的物理尺寸换算需要整块显示器的像素尺寸")
+        display_size = window_size
+    if len(display_size) != 2 or not all(math.isfinite(v) and v > 0 for v in display_size):
+        raise ValueError("显示器宽高必须为有限正数")
+    return cfg.screen_diagonal_inches * 2.54 / math.hypot(*display_size)
 
-    保持正方形和目标顺序；横纵间距独立展开，避免4×10网格浪费上下空间。
-    顶部输出/状态、底部提示及目标指示符均有专用留白，无需创建窗口。
-    """
+
+def calculate_keyboard_layout(cfg: Config, window_size: Sequence[float],
+                              display_size: Optional[Sequence[float]] = None
+                              ) -> tuple[np.ndarray, float, tuple[float, float], float]:
+    """居中网格，保留所设间距；只在放不下时等比例缩小，不拉伸填屏。"""
+    cfg.validate()
     width, height = map(float, window_size)
     if not all(math.isfinite(value) and value > 0 for value in (width, height)):
         raise ValueError("窗口宽高必须为有限正数")
@@ -2455,37 +2376,277 @@ def calculate_keyboard_layout(cfg: Config, window_size: Sequence[float]
     bottom_reserved = 70.0
     available_width = width - 2 * _keyboard_side_margin(width)
     available_height = height - top_reserved - bottom_reserved
-    preferred_scale = min(1.25, width / 1920.0, height / 1080.0) if cfg.allow_layout_scaling else 1.0
-    scale = min(preferred_scale,
-                available_width / (cols * cfg.key_size_px + (cols - 1) * cfg.key_gap_px),
-                available_height / (rows * cfg.key_size_px + (rows - 1) * cfg.key_gap_px))
+    key, gap = cfg.key_size_px, cfg.key_gap_px
+    if cfg.layout_units == "degrees":
+        cm_per_pixel = _display_cm_per_pixel(cfg, window_size, display_size)
+        if cm_per_pixel is None:
+            raise ValueError("视角模式需要填写当前显示器的实际对角线英寸数")
+        key = 2 * cfg.viewing_distance_cm * math.tan(math.radians(cfg.key_size_deg) / 2) / cm_per_pixel
+        gap = 2 * cfg.viewing_distance_cm * math.tan(math.radians(cfg.key_gap_deg) / 2) / cm_per_pixel
+    scale = min(1.0, available_width / (cols * key + (cols - 1) * gap),
+                available_height / (rows * key + (rows - 1) * gap))
     if scale <= 0 or (scale < 1 and not cfg.allow_layout_scaling):
         raise RuntimeError("屏幕不足以容纳固定按键布局；请更换分辨率或允许等比例缩放")
-    key = cfg.key_size_px * scale
-    gap_x = (available_width - cols * key) / (cols - 1)
-    gap_y = (available_height - rows * key) / (rows - 1)
-    center_y = (bottom_reserved - top_reserved) / 2
+    key, gap = key * scale, gap * scale
+    # 能容纳时以屏幕中心为注视原点；顶部输出框挤占空间时向下移动最小距离。
+    grid_height = rows * key + (rows - 1) * gap
+    center_y = min(0.0, height / 2 - top_reserved - grid_height / 2)
     positions = np.asarray([
-        ((target.col - (cols - 1) / 2) * (key + gap_x),
-         center_y + ((rows - 1) / 2 - target.row) * (key + gap_y))
+        ((target.col - (cols - 1) / 2) * (key + gap),
+         center_y + ((rows - 1) / 2 - target.row) * (key + gap))
         for target in TARGETS
     ])
-    return positions, key, (gap_x, gap_y), scale
+    return positions, key, (gap, gap), scale
+
+
+def keyboard_layout_info(cfg: Config, window_size: Sequence[float],
+                         display_size: Optional[Sequence[float]] = None) -> dict[str, Any]:
+    """保存请求值、实际几何及估算视角；不把主观转头体验当作测量结果。"""
+    positions, key, (gap_x, gap_y), scale = calculate_keyboard_layout(cfg, window_size, display_size)
+    cm_per_pixel = _display_cm_per_pixel(cfg, window_size, display_size)
+    corners = [target for target in TARGETS if target.row in (0, len(KEY_ROWS) - 1)
+               and target.col in (0, len(KEY_ROWS[0]) - 1)]
+    physical = None
+    if cm_per_pixel is not None:
+        def angle(length: float) -> float:
+            return math.degrees(2 * math.atan(length * cm_per_pixel / (2 * cfg.viewing_distance_cm)))
+        physical = {
+            "basis": "declared diagonal and distance; square pixels; eye opposite screen center",
+            "cm_per_pix_unit": cm_per_pixel,
+            "key_size_cm": key * cm_per_pixel, "gap_cm": gap_x * cm_per_pixel,
+            "key_centered_visual_angle_deg": angle(key), "gap_centered_visual_angle_deg": angle(gap_x),
+            "grid_width_cm": (10 * key + 9 * gap_x) * cm_per_pixel,
+            "grid_height_cm": (4 * key + 3 * gap_y) * cm_per_pixel,
+            "corners": [{"class_id": t.class_id, "symbol": t.symbol,
+                "center_eccentricity_deg": math.degrees(math.atan(
+                    math.hypot(*positions[t.class_id - 1]) * cm_per_pixel / cfg.viewing_distance_cm)),
+                "outer_edge_eccentricity_deg": math.degrees(math.atan(
+                    math.hypot(*(np.abs(positions[t.class_id - 1]) + key / 2))
+                    * cm_per_pixel / cfg.viewing_distance_cm))} for t in corners],
+        }
+    return {
+        "layout_strategy": "centered_fixed_gap", "layout_schema_version": 1,
+        "requested_layout": {name: getattr(cfg, name) for name in (
+            "layout_units", "key_size_px", "key_gap_px", "key_size_deg", "key_gap_deg",
+            "viewing_distance_cm", "screen_diagonal_inches", "allow_layout_scaling")},
+        "key_size_pix_units": key, "gap_pix_units": gap_x,
+        "column_gap_pix_units": gap_x, "row_gap_pix_units": gap_y,
+        "layout_scale": scale, "fit_reduced": scale < 1 - 1e-9,
+        "key_positions_pix_units": positions.tolist(),
+        "layout_rows": len(KEY_ROWS), "layout_cols": max(map(len, KEY_ROWS)),
+        "target_viewing_distance_cm": cfg.viewing_distance_cm,
+        "declared_screen_diagonal_inches": cfg.screen_diagonal_inches,
+        "display_size_pix_units": list(display_size if display_size is not None else window_size),
+        "physical_estimate": physical,
+    }
+
+
+def _create_keyboard_window(visual: Any, cfg: Config) -> Any:
+    """Windows/macOS 使用目标屏幕尺寸全屏启动，布局随后读取实际像素尺寸。"""
+    size = cfg.window_size
+    import pyglet
+    screens = pyglet.canvas.get_display().get_screens()
+    if not 0 <= cfg.screen_index < len(screens):
+        raise ValueError(f"显示器编号 {cfg.screen_index} 不可用；检测到 {len(screens)} 个显示器")
+    screen = screens[cfg.screen_index]
+    if cfg.full_screen:
+        # 这里使用屏幕逻辑尺寸；Retina 实际绘制尺寸由 PsychoPy 的 win.size 提供。
+        size = (screen.width, screen.height)
+    win = visual.Window(size=size, fullscr=cfg.full_screen, screen=cfg.screen_index,
+        winType="pyglet", useRetina=True,
+        units="pix", color=(-.78, -.77, -.73), colorSpace="rgb", waitBlanking=True,
+        allowGUI=not cfg.full_screen, checkTiming=False, autoLog=False)
+    # 使用实际绘制/客户区比例，避免把调试窗口或高DPI逻辑宽度当作整屏分辨率。
+    ratio = np.asarray(win.size, dtype=float) / np.asarray(win.clientSize, dtype=float)
+    win.keyboard_display_size = np.asarray((screen.width, screen.height)) * ratio
+    return win
+
+
+class KeyboardLayoutPreview:
+    """无EEG、无闪烁的实际尺寸预览；只在确认后交给实验使用。"""
+    corner_ids = (1, 10, 31, 40)
+    rating_names = ("easy", "hard_to_find", "head_turn", "hard_to_find_and_head_turn")
+
+    def __init__(self, cfg: Config, win: Any, visual: Any):
+        self.cfg, self.win, self.visual = cfg, win, visual
+        self.field_index = 0
+        self.corner_index = 0
+        self.ratings: dict[int, str] = {}
+        self.accepted = False
+        self.info: dict[str, Any] = {}
+        self.error = ""
+        width, height = map(float, win.size)
+        self.title = visual.TextStim(win, pos=(0, height / 2 - 22), height=22,
+            wrapWidth=width - 40, color="white", autoLog=False)
+        self.settings = visual.TextStim(win, pos=(0, height / 2 - 56), height=min(20, width / 60),
+            wrapWidth=width - 40, color="#FFE45C", autoLog=False)
+        self.summary = visual.TextStim(win, pos=(0, height / 2 - 92), height=min(17, width / 65),
+            wrapWidth=width - 40, color="white", autoLog=False)
+        self.guide = visual.TextStim(win, pos=(0, height / 2 - 132), height=min(17, width / 65),
+            wrapWidth=width - 40, color="white", autoLog=False)
+        self.footer = visual.TextStim(win, pos=(0, -height / 2 + 31), height=min(17, width / 66),
+            wrapWidth=width - 30, color="white", autoLog=False)
+        self.cross = visual.TextStim(win, text="+", pos=(0, 0), height=18,
+            color="#FFE45C", autoLog=False)
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.error = ""
+        try:
+            self.info = keyboard_layout_info(self.cfg, self.win.size, self.win.keyboard_display_size)
+        except (ValueError, RuntimeError) as exc:
+            # 字段操作保持可用；无效参数不渲染旧网格、不允许进入实验。
+            self.info = {}
+            self.error = str(exc)
+            return
+        key = self.info["key_size_pix_units"]
+        positions = self.info["key_positions_pix_units"]
+        border = 4 * min(1.25, key / 140)
+        self.borders = self.visual.ElementArrayStim(self.win, nElements=len(TARGETS), units="pix",
+            xys=positions, sizes=(key + border, key + border), elementTex=None, elementMask=None,
+            colors=np.tile((-.88, -.89, -.84), (len(TARGETS), 1)), colorSpace="rgb", autoLog=False)
+        self.squares = self.visual.ElementArrayStim(self.win, nElements=len(TARGETS), units="pix",
+            xys=positions, sizes=(key, key), elementTex=None, elementMask=None,
+            colors=np.tile((.72, .58, .82), (len(TARGETS), 1)), colorSpace="rgb", autoLog=False)
+        self.labels = [self.visual.TextStim(self.win, text=t.display_label, pos=pos,
+            height=key * (.32 if len(t.display_label) > 1 else .42), units="pix",
+            color=(-.64, -.67, -.58), colorSpace="rgb", autoLog=False)
+            for t, pos in zip(TARGETS, positions)]
+        self.outline = self.visual.Rect(self.win, width=max(1, key - 4), height=max(1, key - 4),
+            fillColor=None, lineColor="#FFE45C", lineWidth=3, units="pix", autoLog=False)
+
+    def handle_keys(self, keys: Sequence[str]) -> bool:
+        """返回是否确认；参数变更会清空四角评价，防止保存旧布局的主观结果。"""
+        if "escape" in keys:
+            raise AbortSession("用户退出静态布局预览")
+        changed = False
+        if "up" in keys:
+            self.field_index = (self.field_index - 1) % 4
+        if "down" in keys:
+            self.field_index = (self.field_index + 1) % 4
+        if "u" in keys:
+            self.cfg.layout_units = "degrees" if self.cfg.layout_units == "pixels" else "pixels"
+            changed = True
+        degree_mode = self.cfg.layout_units == "degrees"
+        field_names = ("key_size_deg" if degree_mode else "key_size_px",
+                       "key_gap_deg" if degree_mode else "key_gap_px",
+                       "viewing_distance_cm", "screen_diagonal_inches")
+        if "left" in keys or "right" in keys:
+            name = field_names[self.field_index]
+            step = (0.1 if degree_mode else 5.0, 0.1 if degree_mode else 5.0, 1.0, 0.1)[self.field_index]
+            value = getattr(self.cfg, name)
+            # 未填写的尺寸从24英寸开始编辑，但必须根据当前显示器实测/标称值修正。
+            value = 24.0 if value is None else value + step * (1 if "right" in keys else -1)
+            minimum = 0.0 if self.field_index == 1 else step
+            maximum = 89.0 if degree_mode and self.field_index < 2 else 10000.0
+            setattr(self.cfg, name, round(min(maximum, max(minimum, value)), 4))
+            changed = True
+        if "delete" in keys and self.field_index == 3:
+            self.cfg.screen_diagonal_inches = None
+            changed = True
+        if changed:
+            self.accepted = False
+            self.ratings.clear()
+            self.corner_index = 0
+            self.refresh()
+        if "tab" in keys:
+            self.corner_index = (self.corner_index + 1) % len(self.corner_ids)
+        if self.info and not changed:
+            for i, rating in enumerate(self.rating_names, 1):
+                if str(i) in keys or f"num_{i}" in keys:
+                    self.ratings[self.corner_ids[self.corner_index]] = rating
+                    self.corner_index = (self.corner_index + 1) % len(self.corner_ids)
+                    break
+        self.accepted = bool(not changed and self.info
+                             and any(k in keys for k in ("return", "num_enter")))
+        return self.accepted
+
+    def draw(self) -> None:
+        cfg = self.cfg
+        degrees = cfg.layout_units == "degrees"
+        unit = "deg" if degrees else "px"
+        size = cfg.key_size_deg if degrees else cfg.key_size_px
+        gap = cfg.key_gap_deg if degrees else cfg.key_gap_px
+        diagonal = "unknown" if cfg.screen_diagonal_inches is None else f"{cfg.screen_diagonal_inches:g} in"
+        fields = [f"Key: {size:g} {unit}", f"Gap: {gap:g} {unit}",
+                  f"Distance: {cfg.viewing_distance_cm:g} cm", f"Screen: {diagonal}"]
+        fields[self.field_index] = "[ " + fields[self.field_index] + " ]"
+        self.title.text = "STATIC LAYOUT PREVIEW | No flicker"
+        self.settings.text = "   |   ".join(fields)
+        self.footer.text = ("UP/DOWN: field   LEFT/RIGHT: adjust   U: px/deg   DEL: clear screen size\n"
+                            "TAB: next corner   1: easy   2: hard to find   3: head turn   4: both   ENTER: accept   ESC: exit")
+        if self.info:
+            self.borders.draw()
+            self.squares.draw()
+            for label in self.labels:
+                label.draw()
+            corner_id = self.corner_ids[self.corner_index]
+            self.outline.pos = self.info["key_positions_pix_units"][corner_id - 1]
+            self.outline.draw()
+            self.cross.draw()
+            physical = self.info["physical_estimate"]
+            actual = f"Actual: key {self.info['key_size_pix_units']:.1f} px / gap {self.info['gap_pix_units']:.1f} px"
+            fit = f" | FIT REDUCED to {self.info['layout_scale']:.0%}" if self.info["fit_reduced"] else ""
+            if physical:
+                corner = physical["corners"][self.corner_index]
+                self.summary.text = (actual + fit + f" | key ~{physical['key_centered_visual_angle_deg']:.2f} deg\n"
+                    f"Estimated corner center {corner['center_eccentricity_deg']:.1f} deg from screen center; "
+                    "screen inches and eye distance are declared, not measured.")
+            else:
+                self.summary.text = actual + fit + "\nSet actual screen diagonal to estimate viewing angles."
+            rating = self.ratings.get(corner_id, "unrated").replace("_", " ")
+            self.guide.text = (f"From center +, find {TARGETS[corner_id - 1].symbol} at the yellow corner. "
+                               f"Rate 1-4: {rating} | Checked {len(self.ratings)}/4")
+        else:
+            # 与实验窗口保持相同的英文界面，避免字体缺少中文字形。
+            self.summary.text = "Layout unavailable. For degrees, set actual screen inches; otherwise reduce key/gap."
+            self.guide.text = "Adjust settings to restore preview. ENTER is disabled."
+        for text in (self.title, self.settings, self.summary, self.guide, self.footer):
+            text.draw()
+
+    def result(self) -> dict[str, Any]:
+        return {**self.info, "window_size_reported": list(map(int, self.win.size)),
+                "full_screen": bool(self.win.fullscr), "screen_index": self.cfg.screen_index,
+                "static_preview": {"confirmed": self.accepted,
+                    "corners_checked": len(self.ratings),
+                    "flicker_presented": False, "rating_source": "participant_keyboard_self_report",
+                    "corner_ratings": [{"class_id": i, "symbol": TARGETS[i - 1].symbol,
+                                        "rating": self.ratings.get(i)} for i in self.corner_ids]}}
+
+
+def preview_keyboard_layout(cfg: Config) -> dict[str, Any]:
+    from psychopy import visual, event
+    win = _create_keyboard_window(visual, cfg)
+    try:
+        win.mouseVisible = False
+        preview = KeyboardLayoutPreview(cfg, win, visual)
+        event.clearEvents()
+        while True:
+            if preview.handle_keys(event.getKeys()):
+                return preview.result()
+            preview.draw()
+            win.flip()
+    finally:
+        win.close()
 
 
 class PsychoPyKeyboard:
-    def __init__(self, cfg: Config, collector: ContinuousLSL, markers: EventMarkers,
-                 ledger: TrialLedger, recorder: Optional[SessionRecorder] = None):
+    def __init__(self, cfg: Config, collector: ContinuousLSL, markers: Optional[EventMarkers],
+                 ledger: TrialLedger, recorder: Optional[SessionRecorder] = None,
+                 layout_preview: Optional[dict[str, Any]] = None, *, static_only: bool = False):
         from psychopy import visual, event, logging
         self.cfg, self.collector, self.markers, self.ledger = cfg, collector, markers, ledger
         self.recorder = recorder
+        self.layout_preview = layout_preview or {}
+        self.static_only = static_only
+        self.fatal_fault: Optional[dict] = None
+        self.trial_faults: list[dict] = []
         self.visual, self.event = visual, event
         self.clock = collector.clock
         self.cancel = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="FBCCA-decoder")
         self.win: Any = None
         self.display_info: dict = {}
-        self.warning_reason = ""
         self._pause_enabled = False
         self._active_decode_cancel: Optional[threading.Event] = None
         self._decode_future: Any = None
@@ -2495,23 +2656,31 @@ class PsychoPyKeyboard:
         try:
             self._build_window()
         except BaseException:
-            self.close()
+            try:
+                self.close()
+            except Exception:
+                pass  # Preserve the original construction failure.
             raise
 
     def _build_window(self) -> None:
         visual, cfg = self.visual, self.cfg
-        self.win = visual.Window(size=cfg.window_size, fullscr=cfg.full_screen, screen=cfg.screen_index,
-            units="pix", color=(-.78, -.77, -.73), colorSpace="rgb", waitBlanking=True,
-            allowGUI=not cfg.full_screen, checkTiming=False, autoLog=False)
+        self.win = _create_keyboard_window(visual, cfg)
         self.win.mouseVisible = False
         width, height = map(float, self.win.size)
-        self.positions, key, (gap_x, gap_y), scale = calculate_keyboard_layout(cfg, (width, height))
-        self.key_size, self.gap_size, self.layout_scale = key, gap_x, scale
-        self.row_gap_size = gap_y
+        layout = keyboard_layout_info(cfg, (width, height), self.win.keyboard_display_size)
+        if self.layout_preview and any(
+                not np.allclose(self.layout_preview[name], layout[name])
+                for name in ("key_positions_pix_units", "key_size_pix_units", "display_size_pix_units")):
+            raise RuntimeError("显示器或布局在预览后发生变化；请重新启动并检查静态布局")
+        self.positions = np.asarray(layout["key_positions_pix_units"])
+        key, gap_y = layout["key_size_pix_units"], layout["row_gap_pix_units"]
+        scale = min(1.25, key / 140.0)  # 定位框/箭头跟随实际方块大小。
+        self.key_size = key
         # 箭头与外框保持小间距，底行仍留在底栏上方。
-        cue_width = min(40.0, 36.0 * scale)
+        cue_width = min(40.0, 36.0 * scale, max(0.0, gap_y - 12 * scale) * 9 / 5)
+        self._show_cue_arrow = cue_width >= 4
         cue_height = cue_width * 5 / 9
-        self.cue_offset = 14 * scale + cue_height / 2
+        self.cue_offset = 6 * scale + cue_height / 2
         self._static_colors = np.tile((.72, .58, .82), (len(TARGETS), 1))
         # 每个目标的定位画面预先生成；进入闪烁时恢复原始40目标亮度表。
         self._cue_colors = np.tile((-.80, -.81, -.78), (len(TARGETS), len(TARGETS), 1))
@@ -2534,9 +2703,10 @@ class PsychoPyKeyboard:
             fillColor=None, lineColor="black", lineWidth=max(4, 10 * scale), units="pix", autoLog=False)
         self.outline = visual.Rect(self.win, width=key + 14 * scale, height=key + 14 * scale,
             fillColor=None, lineColor="#FFE45C", lineWidth=max(2, 6 * scale), units="pix", autoLog=False)
-        self.triangle = visual.ShapeStim(self.win,
+        self.triangle = (visual.ShapeStim(self.win,
             vertices=((-cue_width/2, -cue_height/2), (cue_width/2, -cue_height/2), (0, cue_height/2)),
             fillColor="#FFE45C", lineColor="black", lineWidth=max(1, 2 * scale), units="pix", autoLog=False)
+            if self._show_cue_arrow else None)
         output_y = height/2 - cfg.output_box_margin_px - cfg.output_box_height_px/2
         output_width = width - 2 * _keyboard_side_margin(width)
         output_text_width = output_width - 48
@@ -2574,7 +2744,8 @@ class PsychoPyKeyboard:
             raise RuntimeError("未测得足够稳定的刷新率；不以猜测的60Hz继续实验")
         self.refresh_hz = float(refresh)
         self.win.refreshThreshold = cfg.frame_long_factor / self.refresh_hz
-        self.luminance = make_luminance_table(self.refresh_hz, cfg.stimulus_s)
+        self.luminance = (np.empty((0, len(TARGETS))) if self.static_only else
+                          make_luminance_table(self.refresh_hz, cfg.stimulus_s))
         # 论文亮度0..1 -> PsychoPy rgb -1..1；全部40目标同步逐帧更新。
         self.rgb_frames = np.repeat((2 * self.luminance - 1)[:, :, None], 3, axis=2)
         self.header.text = "Static render timing check - no flicker"
@@ -2593,28 +2764,19 @@ class PsychoPyKeyboard:
             print("[显示时序警告] 静态绘制出现一个异常帧间隔；继续前请检查负载。", flush=True)
         framebuffer = getattr(self.win, "frameBufferSize", self.win.size)
         content_scale = self.win.getContentScaleFactor() if hasattr(self.win, 'getContentScaleFactor') else None
-        self.display_info = {"window_size_reported": tuple(map(int, self.win.size)),
+        self.display_info = {**layout, "static_preview": self.layout_preview.get("static_preview"),
+            "window_size_reported": tuple(map(int, self.win.size)),
+            "full_screen": bool(self.win.fullscr), "screen_index": cfg.screen_index,
+            "window_backend": self.win.winType,
             "framebuffer_size_reported": tuple(map(int, framebuffer)), "content_scale_factor": content_scale,
-            "refresh_hz_measured": self.refresh_hz, "key_size_pix_units": key, "gap_pix_units": gap_x,
-            "column_gap_pix_units": gap_x, "row_gap_pix_units": gap_y,
-            "layout_strategy": "fill_available_area", "key_positions_pix_units": self.positions.tolist(),
-            "layout_scale": scale, "layout_rows": len(KEY_ROWS), "layout_cols": max(map(len, KEY_ROWS)),
-            "cued_guidance": {"minimum_cue_s": cfg.cue_s, "confirmation_key": "space",
+            "refresh_hz_measured": self.refresh_hz,
+            "cued_guidance": {"timing": "automatic_within_block", "cue_s": cfg.cue_s,
                               "settle_s": cfg.cued_settle_s, "arrow_width_pix_units": cue_width,
                               "dim_others_during_preparation": True, "static_outline_during_stimulus": True},
             "target_viewing_distance_cm": cfg.viewing_distance_cm,
             "declared_screen_diagonal_inches": cfg.screen_diagonal_inches,
             "stimulus_frames": len(self.rgb_frames), "scheduled_stimulus_s": len(self.rgb_frames)/self.refresh_hz,
             "static_render_check": check, "physical_timing_measured": False, "luminance_gamma_calibrated": False}
-        print(f"\n屏幕报告: {self.display_info['window_size_reported']}; framebuffer={self.display_info['framebuffer_size_reported']}; "
-              f"scaleFactor={content_scale}; 实测刷新率={self.refresh_hz:.5f}Hz")
-        print(f"按键{key:.2f} pix、列间距{gap_x:.2f} pix、行间距{gap_y:.2f} pix；"
-              f"目标观看距离{cfg.viewing_distance_cm:g}cm（人工摆放）。")
-        if not math.isclose(scale, 1.0):
-            print(f"按键相对{cfg.key_size_px:g}像素参考尺寸缩放为{scale:.4f}；间距按可用屏幕独立展开。")
-        print("High-DPI/物理尺寸和显示gamma未校准，pix相同不保证视角/物理亮度相同。")
-        print(f"刺激{len(self.rgb_frames)}帧≈{len(self.rgb_frames)/self.refresh_hz:.6f}s；"
-              f"分析窗onset+{cfg.response_delay_s:.3f}到onset+{cfg.response_delay_s+cfg.window_s:.3f}s。")
 
     def _cancel_decode(self) -> None:
         if self._active_decode_cancel is not None:
@@ -2650,6 +2812,8 @@ class PsychoPyKeyboard:
 
     def _draw_keys(self, target_id: Optional[int] = None, flicker_rgb: Optional[np.ndarray] = None,
                    show_outline: bool = False, dim_others: bool = False) -> None:
+        if self.static_only and flicker_rgb is not None:
+            raise RuntimeFault("DISPLAY", "静态自检禁止呈现闪烁帧")
         if flicker_rgb is not None:
             self.squares.colors = flicker_rgb
         elif dim_others and target_id is not None:
@@ -2662,8 +2826,9 @@ class PsychoPyKeyboard:
             label.draw()
         if target_id is not None:
             pos = self.positions[target_id - 1]
-            self.triangle.pos = (pos[0], pos[1] - self.key_size / 2 - self.cue_offset)
-            self.triangle.draw()
+            if self._show_cue_arrow:
+                self.triangle.pos = (pos[0], pos[1] - self.key_size / 2 - self.cue_offset)
+                self.triangle.draw()
             if show_outline:
                 self.outline_shadow.pos = pos
                 self.outline_shadow.draw()
@@ -2676,11 +2841,12 @@ class PsychoPyKeyboard:
         self.footer.draw()
 
     def _prepare_cued_trial(self, record: TrialRecord, cue_event: EventStamp) -> None:
-        """静态定位 → 新的空格确认 → 静态稳定注视；全程允许ESC和流健康检查。"""
+        """静态定位 → 定时稳定注视 → 闪烁；全程允许ESC和流健康检查。"""
         target = TARGETS[record.true_class - 1]
         progress = f"Block {record.block_id}/{self.cfg.blocks} | Trial {record.trial_id}/{self.cfg.blocks*len(TARGETS)}"
         self.cue_title.text = f"TARGET: {target.symbol}    |    ROW {target.row+1}   COL {target.col+1}"
         self.footer.text = f"{progress} | Find the highlighted key ({self.cfg.cue_s:g} s) | ESC: stop"
+        # 菜单启动键及之后的误触都不参与单个试次的时间控制。
         self.event.getKeys(keyList=["space"])
         self._phase(record, "CUE")
         self._check_abort()
@@ -2688,29 +2854,17 @@ class PsychoPyKeyboard:
         self.win.callOnFlip(self.markers.mark, cue_event)
         self.win.flip()
         record.cue_onset = cue_event.timestamp
-        # 使用实际翻转事件时间保证至少完整显示cue_s；提前按下的空格不排队确认。
+        # 使用实际翻转事件时间保证至少完整显示 cue_s。
         while self.clock() - record.cue_onset < self.cfg.cue_s:
             self._check_abort()
             self.event.getKeys(keyList=["space"])
             self._draw_keys(target.class_id, show_outline=True, dim_others=True)
             self.win.flip()
-        self.event.getKeys(keyList=["space"])
-        self._phase(record, "WAIT_CONFIRM")
-        self.footer.text = f"{progress} | Found it? Press SPACE to confirm | ESC: stop"
-        while True:
-            self._check_abort()
-            self._draw_keys(target.class_id, show_outline=True, dim_others=True)
-            self.win.flip()
-            if "space" in self.event.getKeys(keyList=["space"]):
-                confirmed = EventStamp("cue_confirmed", record.trial_id, target.class_id,
-                    {"key": "space", "timestamp_kind": "key_poll", "settle_s": self.cfg.cued_settle_s})
-                self.markers.mark(confirmed)
-                record.cue_confirmed_at = confirmed.timestamp
-                break
         self._phase(record, "FIXATE")
         self.footer.text = f"{progress} | Keep looking at the key center ({self.cfg.cued_settle_s:g} s) | ESC: stop"
         fixation = EventStamp("fixation_onset", record.trial_id, target.class_id,
-                              {"settle_s": self.cfg.cued_settle_s})
+                              {"settle_s": self.cfg.cued_settle_s,
+                               "trigger": "automatic_after_cue"})
         self._check_abort()
         self._draw_keys(target.class_id, show_outline=True, dim_others=True)
         self.win.callOnFlip(self.markers.mark, fixation)
@@ -2746,7 +2900,17 @@ class PsychoPyKeyboard:
     def _persist_trial(self, record: TrialRecord) -> None:
         if self.recorder is None:
             return
-        self.recorder.write_trial(record)
+        try:
+            self.recorder.write_trial(record)
+        except Exception as exc:
+            raise RuntimeFault("SAVE", f"逐试次保存失败；保留 {self.recorder.session_dir}：{exc}") from exc
+
+    def _note_fault(self, exc: BaseException, *, fatal: bool, default: str = "DISPLAY") -> None:
+        fault = fault_record(exc, default)
+        self.trial_faults.append(fault)
+        if fatal:
+            self.fatal_fault = fault
+        print_fault(fault)
 
     @staticmethod
     def _attach_failed_epoch(record: TrialRecord, exc: BaseException) -> None:
@@ -2768,7 +2932,7 @@ class PsychoPyKeyboard:
         reason_codes: list[str] = []
         reasons: list[str] = []
 
-        if not configured:
+        if cfg.rejection_enabled and not configured:
             reason_codes.append("thresholds_unconfigured")
             reasons.append(
                 "拒识阈值未完整配置；请先用明确注视目标和不打算输入的真实EEG数据标定，"
@@ -2799,11 +2963,12 @@ class PsychoPyKeyboard:
                         f"第一/第二名分差{score_margin:.6g}低于阈值{float(min_margin):.6g}")
 
         accepted = bool(
-            configured
-            and max_score is not None
+            max_score is not None
             and score_margin is not None
-            and max_score >= float(min_score)
-            and score_margin >= float(min_margin)
+            and (not cfg.rejection_enabled or (
+                configured
+                and max_score >= float(min_score)
+                and score_margin >= float(min_margin)))
             and not reason_codes
         )
         if accepted:
@@ -2816,6 +2981,7 @@ class PsychoPyKeyboard:
             reason_code = "+".join(reason_codes) or "rejected"
             reason = "拒识：" + "; ".join(reasons)
         return {
+            "enabled": cfg.rejection_enabled,
             "configured": configured,
             "accepted": accepted,
             "max_score": max_score,
@@ -2827,13 +2993,9 @@ class PsychoPyKeyboard:
             "reason": reason,
         }
 
-    def _rejection_reason(self, result: dict[str, Any]) -> Optional[str]:
-        """Return the free-mode rejection message, if the evidence gate fails."""
-        return self._rejection_diagnostics(result)["reason"]
-
     def _rejection_diagnostics_for_mode(self, mode: str,
                                         result: dict[str, Any]) -> Optional[dict[str, Any]]:
-        """Apply the gate only to free input; cued mode remains the baseline."""
+        """Check free-mode scores; apply thresholds only when enabled."""
         return self._rejection_diagnostics(result) if mode == "free" else None
 
     @staticmethod
@@ -2854,46 +3016,26 @@ class PsychoPyKeyboard:
             self._draw_status()
             self.win.flip()
 
-    def _run_trial(self, record: TrialRecord) -> None:
-        cfg = self.cfg
+    def _wait_for_stable_eeg_clock(self) -> int:
         # A discarded OpenBCI chunk resets the sample clock. Start a retry only
         # after its phase and rate checks have settled again.
         settling_started = time.monotonic()
         while True:
             clock_ready, recovery_count_at_start = self.collector.clock_recovery_status()
             if clock_ready:
-                break
+                return recovery_count_at_start
             self.header.text = "EEG clock recovering; waiting for stable data..."
             self._check_abort()
             self._draw_status()
             self.win.flip()
-            if time.monotonic() - settling_started > cfg.startup_timeout_s:
+            if time.monotonic() - settling_started > self.cfg.startup_timeout_s:
                 raise InvalidTrial("OpenBCI时间轴重新稳定超时；本轮重试")
+
+    def _present_trial_stimulus(self, record: TrialRecord, cue_event: EventStamp,
+                                onset_event: EventStamp, offset_event: EventStamp) -> None:
+        cfg = self.cfg
         free = record.mode == "free"
-        if free and record.true_class is not None:
-            raise ValueError("自由输入不应有预设目标")
-        target = None if free else TARGETS[record.true_class - 1]
-        target_id = None if target is None else target.class_id
-        if self._decode_future is not None and not self._decode_future.done():
-            raise RuntimeError("前一次分类尚未退出；请暂停后重试")
-        self._decode_future = None
-        self._active_decode_cancel = threading.Event()
-        self._phase(record, "PREPARE")
-        if free:
-            self.header.text = f"FREE | Selection {record.trial_id} | Choose your next character"
-            self.footer.text = "Keyboard SPACE: pause | ESC: exit | Blank key: space | <-: delete"
-        else:
-            self.header.text = f"Block {record.block_id}/{cfg.blocks} | Trial {record.trial_id}/{cfg.blocks*40} | Look at {target.symbol}"
-            self.footer.text = "Find the highlighted key, then SPACE to confirm | ESC: stop"
-        self._sync_output_text()
-        details = {"mode": record.mode, "window_s": cfg.window_s}
-        if target is not None:
-            details["frequency_hz"] = target.frequency_hz
-        cue_event = EventStamp("ready_onset" if free else "cue_onset", record.trial_id, target_id,
-            {} if free else {"minimum_cue_s": cfg.cue_s, "confirmation_key": "space",
-                             "settle_s": cfg.cued_settle_s})
-        onset_event = EventStamp("stimulus_onset", record.trial_id, target_id, details)
-        offset_event = EventStamp("stimulus_offset", record.trial_id, target_id)
+        target_id = record.true_class
         if free:
             self._phase(record, "READY")
             for frame in range(max(1, round(cfg.free_prepare_s * self.refresh_hz))):
@@ -2936,23 +3078,10 @@ class PsychoPyKeyboard:
             record.frame_flip_times, self.refresh_hz, cfg.frame_long_factor,
             cfg.frame_short_factor, cfg.max_warning_frame_anomalies)
         record.frame_diagnostics['psychopy_frame_intervals_s'] = np.asarray(self.win.frameIntervals).copy()
-        self._phase(record, "BLANK")
-        if record.frame_diagnostics['hard_invalid']:
-            self._blank_until(offset_event.timestamp + cfg.blank_min_s)
-            raise InvalidTrial(f"刺激时序异常：长间隔{record.frame_diagnostics['long_intervals']}，"
-                               f"短间隔{record.frame_diagnostics['short_intervals']}，"
-                               f"严重间隔{record.frame_diagnostics['severe_interval_count']}"
-                               "（单间隔至少2个刷新周期或时间戳非递增），"
-                               f"最大{record.frame_diagnostics['max_interval_ms']:.2f}ms")
-        if record.frame_diagnostics['warning']:
-            print(f"[显示时序警告] trial {record.trial_id} 存在一个异常帧间隔："
-                  f"长间隔{record.frame_diagnostics['long_intervals']}，"
-                  f"短间隔{record.frame_diagnostics['short_intervals']}；继续分类。", flush=True)
-        if self.markers.error is not None:
-            raise InvalidTrial(f"LSL Marker发送失败：{self.markers.error}")
-        self._phase(record, "WAIT_DATA_AND_CLASSIFY")
-        self.header.text = (f"FREE | Selection {record.trial_id} | Processing EEG..." if free
-                            else f"Trial {record.trial_id} | Processing EEG...")
+
+    def _await_trial_result(self, record: TrialRecord, onset_event: EventStamp,
+                            offset_event: EventStamp, recovery_count_at_start: int) -> dict[str, Any]:
+        cfg = self.cfg
         self._decode_future = self.executor.submit(decode_trial, record.trial_id, onset_event.timestamp,
                                                    self.collector, cfg, self._active_decode_cancel)
         while not self._decode_future.done() or self.clock() < offset_event.timestamp + cfg.blank_min_s:
@@ -2965,11 +3094,16 @@ class PsychoPyKeyboard:
         if result['trial_id'] != record.trial_id:
             raise InvalidTrial("收到属于其他试次的分类结果，拒绝提交")
         if self.markers.error is not None:
-            raise InvalidTrial(f"LSL Marker发送失败：{self.markers.error}")
+            raise RuntimeFault("LSL_CONNECTION", f"LSL Marker发送失败：{self.markers.error}")
         if not 1 <= result['prediction'] <= len(TARGETS) or not 1 <= result['cca_prediction'] <= len(TARGETS):
             raise InvalidTrial("预测类别超出40目标范围")
         if self.collector.clock_recovery_status()[1] != recovery_count_at_start:
             raise InvalidTrial("本试次发生OpenBCI时间戳恢复，丢弃预测并重试同一目标")
+        return result
+
+    def _apply_trial_result(self, record: TrialRecord, result: dict[str, Any],
+                            target: Optional[Target]) -> None:
+        free = record.mode == "free"
         record.result = result
         mains = result.get("quality", {}).get("mains_noise", {})
         if mains.get("line_dominated"):
@@ -2984,7 +3118,7 @@ class PsychoPyKeyboard:
             self._phase(record, "FEEDBACK")
             self.header.text = f"FREE | Selection {record.trial_id} | Rejected"
             self.show_message(rejection_reason + "\n\nNo character added.\n"
-                              "Choose your next character in the next round.", cfg.feedback_s)
+                              "Choose your next character in the next round.", self.cfg.feedback_s)
             return
         self.ledger.apply_prediction(result['prediction'])
         record.text_applied = True
@@ -3005,7 +3139,64 @@ class PsychoPyKeyboard:
                         f"CCA: {cca_pred.symbol} ({cca_pred.frequency_hz:.1f} Hz)\n\nESC: stop")
         if mains.get("line_dominated"):
             feedback += "\nHigh mains interference: check electrode / reference / BIAS contact."
-        self.show_message(feedback, cfg.feedback_s)
+        self.show_message(feedback, self.cfg.feedback_s)
+
+    def _run_trial(self, record: TrialRecord) -> None:
+        cfg = self.cfg
+        recovery_count_at_start = self._wait_for_stable_eeg_clock()
+        free = record.mode == "free"
+        if free and record.true_class is not None:
+            raise ValueError("自由输入不应有预设目标")
+        target = None if free else TARGETS[record.true_class - 1]
+        target_id = None if target is None else target.class_id
+        if self._decode_future is not None and not self._decode_future.done():
+            raise RuntimeError("前一次分类尚未退出；请暂停后重试")
+        self._decode_future = None
+        self._active_decode_cancel = threading.Event()
+        self._phase(record, "PREPARE")
+        if free:
+            self.header.text = f"FREE | Selection {record.trial_id} | Choose your next character"
+            self.footer.text = "Keyboard SPACE: pause | ESC: exit | Blank key: space | <-: delete"
+        else:
+            self.header.text = f"Block {record.block_id}/{cfg.blocks} | Trial {record.trial_id}/{cfg.blocks*40} | Look at {target.symbol}"
+            self.footer.text = "Follow the highlighted key; trials advance automatically | ESC: stop"
+        self._sync_output_text()
+        details = {"mode": record.mode, "window_s": cfg.window_s,
+                   "response_delay_s": cfg.response_delay_s,
+                   "minimum_stimulus_s": cfg.stimulus_s}
+        if target is not None:
+            details["frequency_hz"] = target.frequency_hz
+        cue_event = EventStamp("ready_onset" if free else "cue_onset", record.trial_id, target_id,
+            {} if free else {"cue_s": cfg.cue_s, "progression": "automatic",
+                             "settle_s": cfg.cued_settle_s})
+        onset_event = EventStamp("stimulus_onset", record.trial_id, target_id, details)
+        offset_event = EventStamp("stimulus_offset", record.trial_id, target_id)
+        self._present_trial_stimulus(record, cue_event, onset_event, offset_event)
+        self._phase(record, "BLANK")
+        if record.requested_window_end > record.stimulus_offset + 1e-6:
+            self._blank_until(offset_event.timestamp + cfg.blank_min_s)
+            raise InvalidTrial(
+                "EEG分析窗超出实际闪烁区间："
+                f"window_end={record.requested_window_end:.6f}, "
+                f"stimulus_offset={record.stimulus_offset:.6f}；本试次不分类")
+        if record.frame_diagnostics['hard_invalid']:
+            self._blank_until(offset_event.timestamp + cfg.blank_min_s)
+            raise InvalidTrial(f"刺激时序异常：长间隔{record.frame_diagnostics['long_intervals']}，"
+                               f"短间隔{record.frame_diagnostics['short_intervals']}，"
+                               f"严重间隔{record.frame_diagnostics['severe_interval_count']}"
+                               "（单间隔至少2个刷新周期或时间戳非递增），"
+                               f"最大{record.frame_diagnostics['max_interval_ms']:.2f}ms", code="DISPLAY")
+        if record.frame_diagnostics['warning']:
+            print(f"[显示时序警告] trial {record.trial_id} 存在一个异常帧间隔："
+                  f"长间隔{record.frame_diagnostics['long_intervals']}，"
+                  f"短间隔{record.frame_diagnostics['short_intervals']}；继续分类。", flush=True)
+        if self.markers.error is not None:
+            raise RuntimeFault("LSL_CONNECTION", f"LSL Marker发送失败：{self.markers.error}")
+        self._phase(record, "WAIT_DATA_AND_CLASSIFY")
+        self.header.text = (f"FREE | Selection {record.trial_id} | Processing EEG..." if free
+                            else f"Trial {record.trial_id} | Processing EEG...")
+        result = self._await_trial_result(record, onset_event, offset_event, recovery_count_at_start)
+        self._apply_trial_result(record, result, target)
 
     def _select_mode(self) -> str:
         self._pause_enabled = False
@@ -3028,9 +3219,12 @@ class PsychoPyKeyboard:
                     "2   CUED TEST - follow 40 prompted targets\n\n"
                     f"Selected: {label}\n\n"
                     "SPACE or ENTER: start   ESC: exit\n\n"
-                    f"Both modes: {self.cfg.stimulus_s:g} s flicker, {self.cfg.window_s:g} s EEG window.\n"
+                    f"Both modes: at least {self.cfg.stimulus_s:g} s flicker, "
+                    f"{self.cfg.window_s:g} s EEG window starting {self.cfg.response_delay_s:g} s after onset.\n"
                     "Free mode: keyboard SPACE pauses/resumes.\n"
-                    f"Cued mode: cue {self.cfg.cue_s:g} s, SPACE to confirm, then hold gaze {self.cfg.cued_settle_s:g} s.\n"
+                    f"Cued mode: SPACE starts; each target advances automatically after "
+                    f"{self.cfg.cue_s:g} s cue and {self.cfg.cued_settle_s:g} s steady gaze. "
+                    "Block breaks and quality pauses require SPACE.\n"
                     "Blank bottom-left key: insert space.  <-: delete.\n"
                     "No automatic calibration or idle detection.")
                 previous = selected
@@ -3043,6 +3237,8 @@ class PsychoPyKeyboard:
                 return selected
 
     def run(self) -> str:
+        if self.static_only:
+            raise RuntimeFault("DISPLAY", "静态自检不能启动实验")
         mode = self._select_mode()
         return self._run_free() if mode == "free" else self._run_cued()
 
@@ -3097,7 +3293,7 @@ class PsychoPyKeyboard:
         selection_id = 0
         consecutive_invalid = 0
         try:
-            if not self.cfg.rejection_thresholds_configured:
+            if self.cfg.rejection_enabled and not self.cfg.rejection_thresholds_configured:
                 notice = self._rejection_calibration_notice()
                 print("[自由输入保护] " + notice.replace("\n", " "), flush=True)
                 self.show_message(notice, max(self.cfg.feedback_s, 2.0))
@@ -3123,7 +3319,9 @@ class PsychoPyKeyboard:
                     self._attach_failed_epoch(record, exc)
                     record.status = "valid" if record.text_applied else "invalid"
                     record.reason = f"{type(exc).__name__}: {exc}"
-                    fatal = self.collector.error is not None or self.markers.error is not None
+                    fatal = (isinstance(exc, RuntimeFault) or not isinstance(exc, InvalidTrial)
+                             or self.collector.error is not None or self.markers.error is not None)
+                    self._note_fault(exc, fatal=fatal)
                 finally:
                     self._cancel_decode()
                     try:
@@ -3133,6 +3331,7 @@ class PsychoPyKeyboard:
                     except Exception as exc:
                         fatal = True
                         record.reason += f"; display-close error: {exc}"
+                        self._note_fault(exc, fatal=True, default="DISPLAY")
                         if not record.text_applied:
                             record.status = "invalid"
                     record.end = self.clock()
@@ -3148,20 +3347,18 @@ class PsychoPyKeyboard:
                     except Exception as exc:
                         record.reason += f"; marker error: {exc}"
                         fatal = True
+                        self._note_fault(exc, fatal=True, default="LSL_CONNECTION")
                     self.ledger.commit(record)
                     self._persist_trial(record)
                     self._release_free_eeg(record)
                 if record.text_applied:
                     consecutive_invalid = 0
-                    pred = TARGETS[record.result['prediction'] - 1]
-                    print(f"FREE {selection_id:04d}: FBCCA={pred.symbol} ({pred.frequency_hz:.1f}Hz)"
-                          f" | text={self.ledger.typed_text!r}", flush=True)
                 elif record.status == "rejected":
                     # A normal evidence-gate rejection is not an acquisition,
                     # data, or timing fault and must not create a fault streak.
-                    print(f"FREE {selection_id:04d}: rejected | {record.reason}", flush=True)
+                    print(f"FREE {selection_id:04d}: rejected | {_brief_reason(record.reason)}", flush=True)
                 else:
-                    print(f"FREE {selection_id:04d}: no character added | {record.reason}", flush=True)
+                    print(f"FREE {selection_id:04d}: no character added | {_brief_reason(record.reason)}", flush=True)
                 consecutive_invalid = self._advance_free_invalid_streak(
                     consecutive_invalid, record,
                     pause_requested=pause_requested, exit_requested=exit_requested)
@@ -3211,7 +3408,9 @@ class PsychoPyKeyboard:
                 self._attach_failed_epoch(record, exc)
                 record.status = "valid" if record.text_applied else "invalid"
                 record.reason = f"{type(exc).__name__}: {exc}"
-                fatal = self.collector.error is not None or self.markers.error is not None
+                fatal = (isinstance(exc, RuntimeFault) or not isinstance(exc, InvalidTrial)
+                         or self.collector.error is not None or self.markers.error is not None)
+                self._note_fault(exc, fatal=fatal)
                 stop_reason = record.reason
             finally:
                 try:
@@ -3223,6 +3422,7 @@ class PsychoPyKeyboard:
                         record.status = "invalid"
                     record.reason = (record.reason + f"; display-close error: {clear_error}").strip("; ")
                     stop_reason, fatal = record.reason, True
+                    self._note_fault(clear_error, fatal=True, default="DISPLAY")
                 record.end = self.clock()
                 self._phase(record, "COMPLETE")
                 try:
@@ -3234,18 +3434,14 @@ class PsychoPyKeyboard:
                         record.status = "invalid"
                     record.reason = (record.reason + f"; marker error: {marker_error}").strip("; ")
                     stop_reason, fatal = record.reason, True
+                    self._note_fault(marker_error, fatal=True, default="LSL_CONNECTION")
                 self.ledger.commit(record)
                 self._persist_trial(record)
             if record.status == 'valid':
                 consecutive_invalid = 0
-                r = record.result
-                print(f"Trial {trial_id:03d}: true={target_id:02d}, FBCCA={r['prediction']:02d}, CCA={r['cca_prediction']:02d}, "
-                    f"window=[{record.requested_window_start:.6f}, {record.requested_window_end:.6f}), "
-                    f"maxFrame={record.frame_diagnostics['max_interval_ms']:.2f}ms, "
-                    f"compute={r['computation_s']:.3f}s, total={record.end-record.start:.3f}s", flush=True)
             else:
                 consecutive_invalid += 1
-                print(f"Trial {trial_id:03d}: {record.status.upper()} - {record.reason}", flush=True)
+                print(f"Trial {trial_id:03d}: {record.status.upper()} - {_brief_reason(record.reason)}", flush=True)
                 if not fatal:
                     # Preserve the scheduled target. A failed attempt gets a new
                     # trial ID, so every target can still obtain one valid epoch.
@@ -3272,69 +3468,104 @@ class PsychoPyKeyboard:
                 self.win.flip()
             except Exception:
                 pass
-            self.win.close()
-            self.win = None
-        self.executor.shutdown(wait=True, cancel_futures=True)
+        try:
+            if self.win is not None:
+                self.win.close()
+                self.win = None
+        finally:
+            self.executor.shutdown(wait=True, cancel_futures=True)
 
 
-def print_target_mapping() -> None:
-    print("\n=== 唯一目标映射（类别1-based，显示行列也转为1-based）===")
-    for target in TARGETS:
-        print(f"ID{target.class_id:02d}: {target.symbol:>5}  行{target.row+1}列{target.col+1}  {target.frequency_hz:4.1f}Hz")
+def static_ui_self_test(cfg: Config, *, seconds: float = 5.0) -> dict:
+    """Render the production keyboard, fixed cue and output; never start LSL or decoding."""
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("自检时长必须为有限正数")
+    app = None
+    result = {"status": "cancelled", "exit_code": 130,
+              "eeg_connected": False, "flicker_presented": False,
+              "scope": "静态布局、字体、窗口与软件刷新时序；不验证EEG、识别准确率或物理显示延迟"}
+    try:
+        # An unstarted collector only supplies the monotonic clock/health interface.
+        # Do not construct EventMarkers, a recorder, or a fake EEG stream.
+        app = PsychoPyKeyboard(replace(cfg), ContinuousLSL(cfg), None, TrialLedger(), static_only=True)
+        app.ledger.typed_text = "STATIC UI CHECK  ABC 123"
+        app._sync_output_text(force=True)
+        app.cue_title.text = "STATIC UI CHECK - no EEG / no flicker"
+        app.footer.text = "40 keys + output + fixed cue | ESC: cancel | Closes automatically"
+        started = time.monotonic()
+        while time.monotonic() - started < seconds:
+            app._check_abort()
+            app._draw_keys(1, show_outline=True)
+            app.win.flip()
+        result.update(status="passed", exit_code=0, display_info=app.display_info)
+    except AbortSession:
+        print("静态界面自检已取消，未记为通过。", flush=True)
+    except Exception as exc:
+        raise RuntimeFault("DISPLAY", str(exc)) from exc
+    finally:
+        if app is not None:
+            try:
+                app.close()
+            except Exception as exc:
+                fault = fault_record(exc, "DISPLAY")
+                result.setdefault("errors", []).append(fault)
+                result.update(status="failed", exit_code=40)
+                print_fault(fault)
+    if result["status"] == "passed":
+        print("静态界面自检通过：40键、文字、输出框、固定提示与静态绘制时序已检查。", flush=True)
+    return result
 
 
-def main() -> dict:
+def main(*, cfg: Optional[Config] = None) -> dict:
     """唯一运行入口；不要求CLI参数；返回全部内存记录。"""
     global LAST_SESSION
-    cfg = CONFIG
+    # 启动对话框与模式菜单会修改配置；每场会话从用户设定的默认值复制。
+    cfg = replace(cfg if cfg is not None else CONFIG)
+    if os.environ.get("FBCCA_QUICK_ENTRY") == "1":
+        cfg.quick_entry_mode = True
     cfg.validate()
-    # 直接运行时已在文件顶部自动补齐缺失依赖；这里再做一次实际导入验证。
-    print("[1/4] 检查界面和采集依赖…", flush=True)
-    try:
-        import scipy
-        import pylsl
-        # 只import psychopy无法发现i18next等缺失的界面依赖。
-        from psychopy import visual, event, gui
-        import threadpoolctl
-    except (ImportError, RuntimeError) as exc:
-        raise RuntimeError(
-            f"界面/采集依赖导入失败，当前Python：{sys.executable}\n"
-            "这台电脑请先用同目录的 start_keyboard_dual_mode.cmd 启动（优先使用Python 3.10）。\n"
-            "原始错误：" + str(exc)) from exc
+    print("[1/4] 运行环境由启动入口核验；准备静态布局与保存目录检查…", flush=True)
     print(f"安全提示：此程序呈现{BENCHMARK_FREQUENCIES_HZ.min():g}–{BENCHMARK_FREQUENCIES_HZ.max():g}Hz视觉闪烁。"
           "对闪光敏感、有光敏性癫痫史者不要自行测试；"
           "出现眼部不适、头痛、眩晕等应立即按ESC停止。先阅读风险并核对接线，程序不会直接开始闪烁。")
-    print("模式：启动界面1=自由输入，2=提示测试；当前默认="
-          + ("提示测试" if cfg.session_mode == "cued" else "自由输入")
-          + "；没有迷宫或操作系统按键注入。")
-    print(f"提示测试：定位至少{cfg.cue_s:g}秒，SPACE确认后稳定注视{cfg.cued_settle_s:g}秒，再开始闪烁。")
-    print("自由输入不需要先做40轮测试；本版未添加个人校准或空闲检测，休息时按SPACE暂停。")
-    print(f"闪烁时长={cfg.stimulus_s:g}秒；EEG分析窗={cfg.window_s:g}秒，"
-          f"从闪烁开始后{cfg.response_delay_s:g}秒起截取。")
-    if cfg.quick_entry_mode:
-        print("*** QUICK ENTRY 仅跳过启动核验交互；时间戳、质量和显示门控仍然生效。 ***", flush=True)
-    print(f"参数：{cfg.filter_bank_profile}，{len(cfg.filter_bands)}子带、{cfg.n_harmonics}谐波、"
-          f"a={cfg.weight_a}, b={cfg.weight_b}, target_fs={cfg.target_fs}Hz")
-    print_target_mapping()
     collector = ContinuousLSL(cfg)
     ledger = TrialLedger()
     markers: Optional[EventMarkers] = None
     app: Optional[PsychoPyKeyboard] = None
     recorder: Optional[SessionRecorder] = None
+    layout_preview: dict[str, Any] = {}
     review: dict = {}
     reason = "Not started"
-    runtime_failed = False
+    errors: list[dict] = []
+    stage = "SAVE"
+
+    def add_error(exc: BaseException, default: str) -> None:
+        fault = fault_record(exc, default)
+        errors.append(fault)
+        print_fault(fault)
+
     try:
+        probe_save_directory(cfg.record_root)
+        stage = "DISPLAY"
+        print("先检查静态布局：方向键调整尺寸/间距/距离/屏幕英寸，U切换像素/视角；"
+              "按1–4评价四角，ENTER确认；此阶段无闪烁、无需EEG。", flush=True)
+        layout_preview = preview_keyboard_layout(cfg)
+        stage = "SAVE"
         recorder = SessionRecorder(cfg, context={"mode_at_start": cfg.session_mode,
-                                                  "quick_entry_mode": cfg.quick_entry_mode})
+                                                  "quick_entry_mode": cfg.quick_entry_mode,
+                                                  "layout_preview": layout_preview})
         print("\n[2/4] 连接EEG LSL并检查采样时间轴（请保持采集软件的LSL输出开启）…", flush=True)
+        stage = "LSL_CONNECTION"
         collector.start()
         print("[3/4] EEG已接收，快速模式直接继续…" if cfg.quick_entry_mode
               else "[3/4] EEG已接收，打开启动核验对话框…", flush=True)
+        stage = "DISPLAY"
         review = preflight_review(cfg, collector)
+        stage = "LSL_CONNECTION"
         markers = EventMarkers(cfg, collector.clock)
         markers.mark(EventStamp("session_start", 0, details={"mode_at_start": cfg.session_mode}))
         # 预热SciPy/BLAS与分类代码，但不使用真实目标，不计入准确率。
+        stage = "INTERNAL"
         t = np.arange(sample_count(cfg.window_s, cfg.target_fs)) / cfg.target_fs
         warm = np.tile(np.sin(2*np.pi*10*t), (len(cfg.channel_indices), 1))
         from threadpoolctl import threadpool_limits
@@ -3342,16 +3573,18 @@ def main() -> dict:
             classify_eeg_window(warm, cfg.target_fs, cfg.window_s, target_fs=cfg.target_fs,
                 notch_hz=cfg.notch_hz, n_harmonics=cfg.n_harmonics,
                 a=cfg.weight_a, b=cfg.weight_b, regularization=cfg.cca_regularization,
-                filter_bands=cfg.filter_bands)
+                filter_bands=cfg.filter_bands, line_regression_hz=cfg.line_regression_hz)
         print("[4/4] 创建键盘窗口；在菜单按1自由输入、2提示测试，再按SPACE开始…", flush=True)
-        app = PsychoPyKeyboard(cfg, collector, markers, ledger, recorder)
+        stage = "DISPLAY"
+        app = PsychoPyKeyboard(cfg, collector, markers, ledger, recorder, layout_preview)
         reason = app.run()
+        if app.fatal_fault is not None:
+            errors.append(app.fatal_fault)
     except (AbortSession, KeyboardInterrupt) as exc:
         reason = str(exc) or "用户中止"
     except Exception as exc:
-        runtime_failed = True
+        add_error(exc, stage)
         reason = f"{type(exc).__name__}: {exc}"
-        print(f"\n实验停止：{reason}", flush=True)
     finally:
         # 窗口/设备关闭异常不能跳过已采集数据的最终导出。
         for resource in (app, collector):
@@ -3359,18 +3592,18 @@ def main() -> dict:
                 try:
                     resource.close()
                 except Exception as exc:
-                    runtime_failed = True
+                    add_error(exc, "DISPLAY" if resource is app else "ACQUISITION")
                     reason += f"; {type(resource).__name__}.close: {type(exc).__name__}: {exc}"
         if markers is not None:
             try:
                 markers.mark(EventStamp("session_end", 0, details={"stop_reason": reason}))
             except Exception as exc:
-                runtime_failed = True
+                add_error(exc, "LSL_CONNECTION")
                 reason += f"; session_end marker: {type(exc).__name__}: {exc}"
             try:
                 markers.close()
             except Exception as exc:
-                runtime_failed = True
+                add_error(exc, "LSL_CONNECTION")
                 reason += f"; markers.close: {type(exc).__name__}: {exc}"
         report = (summarize_free_trials(ledger.records, ledger) if cfg.session_mode == "free"
                   else summarize_trials(ledger.records, cfg.blocks * len(TARGETS)))
@@ -3381,44 +3614,45 @@ def main() -> dict:
                     summary=report, events=markers.events if markers else [],
                     acquisition_metadata=collector.metadata, acquisition_review=review,
                     clock_updates=collector.clock_updates,
-                    display_info=app.display_info if app else {},
+                    display_info=app.display_info if app else layout_preview,
                     typed_text=ledger.typed_text, stop_reason=reason)
             except Exception as exc:
-                runtime_failed = True
+                add_error(exc, "SAVE")
+                reason += f"; 保存失败：{exc}"
                 if recorder.session_path.exists():
                     session_artifact = str(recorder.session_path)
                     print(f"会话NPZ已保存，但临时文件清理未完成：{type(exc).__name__}: {exc}", flush=True)
                 else:
                     print(f"实验记录导出失败，已有逐试次文件保留：{type(exc).__name__}: {exc}", flush=True)
+        if collector.error is not None and not any(f["code"] == "ACQUISITION" for f in errors):
+            add_error(collector.error, "ACQUISITION")
+        if markers is not None and markers.error is not None and not any(f["code"] == "LSL_CONNECTION" for f in errors):
+            add_error(markers.error, "LSL_CONNECTION")
         LAST_SESSION = {"mode": cfg.session_mode, "config": cfg, "targets": TARGETS, "records": ledger.records,
             "events": markers.events if markers else [], "acquisition_metadata": collector.metadata,
             "acquisition_review": review, "clock_updates": collector.clock_updates,
-            "display_info": app.display_info if app else {}, "summary": report,
+            "display_info": app.display_info if app else layout_preview, "summary": report,
             "typed_text": ledger.typed_text, "stop_reason": reason,
-            "exit_code": int(runtime_failed or collector.error is not None
-                             or (markers is not None and markers.error is not None)),
+            "exit_code": (50 if any(f["code"] == "SAVE" for f in errors)
+                          else errors[0]["exit_code"] if errors else 0),
+            "errors": errors, "trial_faults": app.trial_faults if app else [],
             "session_artifact": session_artifact,
             "export_artifacts": dict(recorder.export_artifacts) if recorder else {},
             "marker_error": str(markers.error) if markers and markers.error else None,
             "validation_scope": "software events only; physical screen/device delays unmeasured"}
-        print(f"\n结束原因：{reason}")
-        if session_artifact is not None:
-            print(f"实验记录已保存：{session_artifact}")
+        if cfg.session_mode == "free":
+            print_free_summary(report)
+        else:
+            print_summary(report, ledger)
+        saved_path = session_artifact
+        if saved_path is None and recorder is not None and recorder.session_dir.exists():
+            saved_path = str(recorder.session_dir)
+        print(f"结束原因：{reason}")
+        print(f"保存路径：{saved_path or '未生成'}")
         if recorder is not None:
             for path in recorder.export_artifacts.values():
                 if path != session_artifact:
                     print(f"导出文件：{path}")
         if markers is not None and markers.error is not None:
             print(f"外部Marker发送存在错误：{markers.error}；请勿把本次外部Marker流视为完整。")
-        if cfg.session_mode == "free":
-            print_free_summary(report)
-        else:
-            print_summary(report, ledger)
     return LAST_SESSION
-
-
-if __name__ == "__main__":
-    try:
-        raise SystemExit(main()["exit_code"])
-    except (ImportError, RuntimeError, ValueError) as exc:
-        raise SystemExit(f"启动失败：{exc}") from exc

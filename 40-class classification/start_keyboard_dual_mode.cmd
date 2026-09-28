@@ -6,13 +6,11 @@ set "PYTHONUTF8=1"
 set "PYTHONUNBUFFERED=1"
 set "PYTHONDONTWRITEBYTECODE=1"
 if not defined FBCCA_QUICK_ENTRY set "FBCCA_QUICK_ENTRY=1"
-set "PYTHON_EXE=%~dp0.venv\Scripts\python.exe"
-set "EXIT_CODE=10"
-if not exist "%PYTHON_EXE%" (
-    echo [ENVIRONMENT] Project .venv is missing. Run setup_windows.cmd explicitly first.
-    goto finished
+if exist "%~dp0.venv\Scripts\python.exe" (
+    "%~dp0.venv\Scripts\python.exe" "%~dp0fbcca_keyboard_dual_mode.py" %*
+) else (
+    py -3.10 "%~dp0fbcca_keyboard_dual_mode.py" %*
 )
-"%PYTHON_EXE%" "%~dp0run_keyboard.py" %*
 set "EXIT_CODE=%ERRORLEVEL%"
 :finished
 echo Exit code: %EXIT_CODE%

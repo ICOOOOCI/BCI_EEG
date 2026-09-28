@@ -19,16 +19,9 @@ https://psychopy.org/api/visual/window.html
 """
 from __future__ import annotations
 
-# 所有直接启动均先经过只读环境检查；import 仍可用于离线算法分析。
-import sys
-
-if __name__ == "__main__":
-    from run_keyboard import cli
-    raise SystemExit(cli())
-
-from runtime_support import (RuntimeFault, environment_snapshot, fault_record, print_fault,
-                             probe_save_directory)
-
+import argparse
+import importlib
+import importlib.metadata as metadata
 import os
 # 避免小型 CCA 矩阵运算动用大量 BLAS 线程；已有环境设置不覆盖。
 for _name in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS"):
@@ -38,10 +31,14 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import platform
 import queue
+import struct
+import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile
@@ -52,6 +49,120 @@ from fractions import Fraction
 from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
+
+
+# ======================== 运行支持（合并自原辅助模块） ========================
+ROOT = Path(__file__).resolve().parent
+PYTHON_VERSION = (3, 10, 11)
+FAULTS = {
+    "ENVIRONMENT": (10, "运行环境不匹配", "请安装 64 位 CPython 3.10.11 及程序依赖。"),
+    "LSL_LIBRARY": (20, "无法加载 LSL 动态库", "检查 pylsl/liblsl 和 Python 的架构是否一致。"),
+    "LSL_NOT_FOUND": (21, "找不到 EEG LSL 流", "开启发布端的 LSL 输出并检查网络。"),
+    "LSL_CONNECTION": (22, "LSL 连接或事件流异常", "检查重复流、通道配置、发布端和网络。"),
+    "ACQUISITION": (30, "采样中断或 EEG 数据异常", "检查设备连接、采样率和时间戳。"),
+    "DISPLAY": (40, "显示异常", "检查显示器、刷新率、显卡驱动和系统负载。"),
+    "SAVE": (50, "保存失败", "检查目标目录权限和磁盘空间。"),
+    "INTERNAL": (70, "程序异常", "查看终端错误信息和系统临时目录中的诊断报告。"),
+}
+
+
+def configure_console() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
+class RuntimeFault(RuntimeError):
+    def __init__(self, code: str, detail: str):
+        self.code = code
+        super().__init__(detail)
+
+
+def fault_record(exc: BaseException, default: str = "INTERNAL") -> dict:
+    code = getattr(exc, "code", default)
+    exit_code, title, action = FAULTS[code]
+    return {"code": code, "exit_code": exit_code, "title": title, "detail": str(exc),
+            "action": action,
+            "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))}
+
+
+def print_fault(fault: dict) -> None:
+    print(f"[{fault['code']}] {fault['title']}：{fault['detail']}\n处理建议：{fault['action']}",
+          file=sys.stderr, flush=True)
+
+
+def environment_snapshot() -> dict:
+    return {"python": sys.version, "executable": sys.executable, "prefix": sys.prefix,
+            "platform": platform.platform(), "machine": platform.machine(),
+            "bits": struct.calcsize("P") * 8,
+            "packages": {d.metadata["Name"]: d.version for d in metadata.distributions()
+                         if d.metadata.get("Name")},
+            "pylsl_lib_override": os.environ.get("PYLSL_LIB")}
+
+
+def check_environment(*, static_ui: bool = False) -> dict:
+    issues = []
+    if (sys.version_info[:3] != PYTHON_VERSION or struct.calcsize("P") != 8
+            or platform.python_implementation() != "CPython"):
+        issues.append(f"需要 64 位 CPython {'.'.join(map(str, PYTHON_VERSION))}；当前 {platform.python_version()}")
+    for name in ("numpy", "scipy", "threadpoolctl", "psychopy.visual", "psychopy.event", "psychopy.gui"):
+        try:
+            importlib.import_module(name)
+        except Exception as exc:
+            issues.append(f"{name} 无法导入：{exc}")
+    result = {"python_version": platform.python_version(), "lsl_checked": not static_ui}
+    if not static_ui:
+        try:
+            pylsl = importlib.import_module("pylsl")
+            result["liblsl_version"] = pylsl.library_version()
+            result["liblsl_build"] = pylsl.library_info()
+        except Exception as exc:
+            raise RuntimeFault("LSL_LIBRARY", str(exc)) from exc
+    if issues:
+        raise RuntimeFault("ENVIRONMENT", "\n".join(issues) + f"\nPython：{sys.executable}")
+    return result
+
+
+def probe_save_directory(directory: str | Path) -> str:
+    directory = Path(directory)
+    if not directory.is_absolute():
+        directory = ROOT / directory
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".write-check-", dir=directory) as tmp:
+            source, target = Path(tmp) / "probe.tmp", Path(tmp) / "probe.ok"
+            with source.open("wb") as handle:
+                handle.write(b"BCI write check\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(source, target)
+            if target.read_bytes() != b"BCI write check\n":
+                raise OSError("保存后内容校验失败")
+    except Exception as exc:
+        raise RuntimeFault("SAVE", f"目录 {directory} 不可可靠写入：{exc}") from exc
+    return str(directory)
+
+
+def write_diagnostic(report: dict) -> str | None:
+    """诊断记录写入系统临时目录，避免在主程序目录留下辅助文件。"""
+    name = time.strftime("run_%Y%m%dT%H%M%SZ_", time.gmtime()) + uuid.uuid4().hex[:8] + ".json"
+    try:
+        report["environment"] = environment_snapshot()
+    except Exception as exc:
+        report["environment_snapshot_error"] = str(exc)
+    folder = Path(tempfile.gettempdir()) / "bci-eeg-diagnostics"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / name
+        path.write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        print(f"诊断报告：{path}", flush=True)
+        return str(path)
+    except OSError as exc:
+        print(f"[SAVE] 诊断报告写入失败：{folder}：{exc}", file=sys.stderr, flush=True)
+        return None
 
 
 # ======================== 配置：通常只修改这一处 ========================
@@ -3656,3 +3767,75 @@ def main(*, cfg: Optional[Config] = None) -> dict:
         if markers is not None and markers.error is not None:
             print(f"外部Marker发送存在错误：{markers.error}；请勿把本次外部Marker流视为完整。")
     return LAST_SESSION
+
+
+def positive_seconds(value: str) -> float:
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("seconds 必须是有限正数")
+    return seconds
+
+
+def cli(argv=None) -> int:
+    """Windows 与 macOS 共用的单文件命令行入口。"""
+    configure_console()
+    parser = argparse.ArgumentParser(description="40目标 EEG 键盘")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--diagnose", action="store_true", help="检查依赖、liblsl 和保存目录")
+    modes.add_argument("--self-test-ui", action="store_true", help="运行静态键盘自检")
+    modes.add_argument("--preview-layout", action="store_true", help="交互调整静态布局")
+    parser.add_argument("--seconds", type=positive_seconds, default=5.0, help="静态自检展示秒数")
+    parser.add_argument("--windowed", action="store_true", help="使用1280×800窗口")
+    parser.add_argument("--screen", type=int, help="显示器编号，从0开始")
+    parser.add_argument("--record-root", help="会话保存目录")
+    args = parser.parse_args(argv)
+    if args.screen is not None and args.screen < 0:
+        parser.error("screen 必须非负")
+    report = {
+        "mode": "static_ui" if args.self_test_ui else "layout_preview" if args.preview_layout
+                else "diagnose" if args.diagnose else "eeg",
+        "status": "failed", "errors": [], "exit_code": 0,
+    }
+    try:
+        report["checks"] = check_environment(static_ui=args.self_test_ui or args.preview_layout)
+        cfg = replace(CONFIG)
+        if args.windowed:
+            cfg.full_screen, cfg.window_size = False, (1280, 800)
+        if args.screen is not None:
+            cfg.screen_index = args.screen
+        if args.record_root:
+            cfg.record_root = args.record_root
+        cfg.validate()
+        if args.preview_layout:
+            try:
+                report["display_info"] = preview_keyboard_layout(cfg)
+                report["status"] = "finished"
+            except AbortSession:
+                report.update(status="cancelled", exit_code=130)
+            except Exception as exc:
+                raise RuntimeFault("DISPLAY", str(exc)) from exc
+        elif args.self_test_ui:
+            report.update(static_ui_self_test(cfg, seconds=args.seconds))
+        elif args.diagnose:
+            report["checks"]["save_directory"] = probe_save_directory(cfg.record_root)
+            report["status"] = "passed"
+            print("环境诊断通过；尚未验证 EEG 流、真实采样或显示窗口。", flush=True)
+        else:
+            result = main(cfg=cfg)
+            report.update({key: result[key] for key in
+                           ("exit_code", "errors", "trial_faults", "stop_reason", "session_artifact")})
+            report["status"] = "failed" if report["exit_code"] else "finished"
+    except KeyboardInterrupt:
+        report.update(status="cancelled", exit_code=130)
+    except Exception as exc:
+        fault = fault_record(exc)
+        report["errors"].append(fault)
+        report["exit_code"] = fault["exit_code"]
+        print_fault(fault)
+    if write_diagnostic(report) is None and not report["exit_code"]:
+        report["exit_code"] = 50
+    return report["exit_code"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())

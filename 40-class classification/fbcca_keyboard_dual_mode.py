@@ -2,7 +2,7 @@
 
 启动界面：1=自由输入，2=提示测试（默认）；SPACE/ENTER开始，ESC退出。
 启动前静态预览：调整尺寸/间距/距离，逐个检查四角；--preview-layout 可单独预览。
-提示测试：SPACE启动整组；每个目标按固定提示、稳定注视和闪烁时序自动推进。
+提示测试：SPACE启动整组；每完成10个目标静态休息30秒，最后3秒逐秒提示音后自动继续。
 自由输入：自行注视字符，每轮真实LSL EEG经FBCCA识别后写入顶部OUTPUT框。
 电脑键盘SPACE暂停/继续；屏幕内SPACE目标插入空格，BACK目标删除上一字符。
 采用4×10 QWERTY布局；按新行列重排40类及频率（8–15.8 Hz）。
@@ -61,6 +61,7 @@ FAULTS = {
     "LSL_CONNECTION": (22, "LSL 连接或事件流异常", "检查重复流、通道配置、发布端和网络。"),
     "ACQUISITION": (30, "采样中断或 EEG 数据异常", "检查设备连接、采样率和时间戳。"),
     "DISPLAY": (40, "显示异常", "检查显示器、刷新率、显卡驱动和系统负载。"),
+    "AUDIO": (41, "提示音异常", "检查扬声器、系统音量和 PsychoPy 音频设备。"),
     "SAVE": (50, "保存失败", "检查目标目录权限和磁盘空间。"),
     "INTERNAL": (70, "程序异常", "查看终端错误信息和系统临时目录中的诊断报告。"),
 }
@@ -173,8 +174,8 @@ class Config:
     # 启动界面按1/2选择，SPACE或ENTER开始；默认进行40目标提示测试。
     session_mode: str = "cued"
     free_prepare_s: float = 1.0  # 每轮闪烁前留出时间，自行选择下一个字符。
-    # 两种模式默认分析窗1.5秒；闪烁额外覆盖0.14秒起始延迟及帧余量。
-    protocol: str = "short_1p5s"
+    # 两种模式默认分析窗2秒；闪烁额外覆盖0.14秒起始延迟及帧余量。
+    protocol: str = "standard_2s"
     # 快速模式只跳过启动核验弹窗；保留模式菜单及时间戳、质量、显示时序门控。
     quick_entry_mode: bool = False
     blocks: int = 1
@@ -184,6 +185,8 @@ class Config:
     response_delay_s: float = 0.14
     blank_min_s: float = 0.5
     feedback_s: float = 0.5
+    cued_rest_every: int = 10  # 模式2每完成多少个有效目标后休息；不在整组结束后重复休息。
+    cued_rest_s: float = 30.0  # 模式2组内休息时长；到时自动继续。
     block_rest_s: float = 30.0
     max_consecutive_invalid: int = 3
 
@@ -254,7 +257,7 @@ class Config:
     full_screen: bool = True  # Windows/macOS 默认铺满目标显示器；仅调试时关闭。
     screen_index: int = 0
     window_size: tuple[int, int] = (1920, 1080)  # 仅用于非全屏调试窗口。
-    layout_units: str = "pixels"  # pixels=实际绘制像素；degrees=按观看距离换算中心视角。
+    layout_units: str = "pixels"  # pixels=PsychoPy 的 pix 坐标；Retina 上是窗口逻辑像素。
     key_size_px: float = 140.0
     key_gap_px: float = 30.0  # 行列使用相同边缘间距，剩余空间留在网格外侧。
     key_size_deg: float = 2.0
@@ -270,8 +273,8 @@ class Config:
 
     @property
     def window_s(self) -> float:
-        presets = {"debug_2s": 2.0, "paper_window_1p25s": 1.25,
-                   "short_1p5s": 1.5, "paper_offline_5s": 5.0}
+        presets = {"standard_5s": 5.0, "standard_2s": 2.0, "debug_2s": 2.0,
+                   "paper_window_1p25s": 1.25, "paper_offline_5s": 5.0}
         if self.protocol not in presets:
             raise ValueError(f"未知 protocol: {self.protocol}; 可选 {tuple(presets)}")
         return presets[self.protocol]
@@ -318,11 +321,13 @@ class Config:
             raise ValueError("时间轴微调速率必须在0和0.1之间")
         if not math.isfinite(self.free_prepare_s) or self.free_prepare_s <= 0:
             raise ValueError("free_prepare_s 必须是有限正数")
-        for name in ("blocks", "n_harmonics", "min_valid_channels", "max_consecutive_invalid"):
+        for name in ("blocks", "n_harmonics", "min_valid_channels", "max_consecutive_invalid",
+                     "cued_rest_every"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} 必须是正整数")
-        for name in ("cue_s", "cued_settle_s", "response_delay_s", "blank_min_s", "feedback_s", "block_rest_s"):
+        for name in ("cue_s", "cued_settle_s", "response_delay_s", "blank_min_s", "feedback_s",
+                     "cued_rest_s", "block_rest_s"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
                 raise ValueError(f"{name} 必须非负且有限")
         for name in ("connect_timeout_s", "startup_timeout_s", "warmup_s", "data_wait_timeout_s",
@@ -2462,7 +2467,7 @@ def _keyboard_side_margin(width: float) -> float:
 
 def _display_cm_per_pixel(cfg: Config, window_size: Sequence[float],
                           display_size: Optional[Sequence[float]] = None) -> Optional[float]:
-    """对角线来自人工填写；窗口模式必须提供整块屏幕的绘制像素尺寸。"""
+    """对角线来自人工填写；窗口模式需提供整屏的 PsychoPy pix 坐标尺寸。"""
     if cfg.screen_diagonal_inches is None:
         return None
     if display_size is None:
@@ -2536,7 +2541,8 @@ def keyboard_layout_info(cfg: Config, window_size: Sequence[float],
                     * cm_per_pixel / cfg.viewing_distance_cm))} for t in corners],
         }
     return {
-        "layout_strategy": "centered_fixed_gap", "layout_schema_version": 1,
+        "layout_strategy": "centered_fixed_gap", "layout_schema_version": 2,
+        "coordinate_space": "psychopy_pix_client",
         "requested_layout": {name: getattr(cfg, name) for name in (
             "layout_units", "key_size_px", "key_gap_px", "key_size_deg", "key_gap_deg",
             "viewing_distance_cm", "screen_diagonal_inches", "allow_layout_scaling")},
@@ -2553,7 +2559,7 @@ def keyboard_layout_info(cfg: Config, window_size: Sequence[float],
 
 
 def _create_keyboard_window(visual: Any, cfg: Config) -> Any:
-    """Windows/macOS 使用目标屏幕尺寸全屏启动，布局随后读取实际像素尺寸。"""
+    """Windows/macOS 使用目标屏幕尺寸全屏启动，布局使用 PsychoPy pix 坐标。"""
     size = cfg.window_size
     import pyglet
     screens = pyglet.canvas.get_display().get_screens()
@@ -2561,16 +2567,25 @@ def _create_keyboard_window(visual: Any, cfg: Config) -> Any:
         raise ValueError(f"显示器编号 {cfg.screen_index} 不可用；检测到 {len(screens)} 个显示器")
     screen = screens[cfg.screen_index]
     if cfg.full_screen:
-        # 这里使用屏幕逻辑尺寸；Retina 实际绘制尺寸由 PsychoPy 的 win.size 提供。
+        # pyglet 屏幕尺寸与 PsychoPy 的客户区同属逻辑坐标。
         size = (screen.width, screen.height)
     win = visual.Window(size=size, fullscr=cfg.full_screen, screen=cfg.screen_index,
         winType="pyglet", useRetina=True,
         units="pix", color=(-.78, -.77, -.73), colorSpace="rgb", waitBlanking=True,
         allowGUI=not cfg.full_screen, checkTiming=False, autoLog=False)
-    # 使用实际绘制/客户区比例，避免把调试窗口或高DPI逻辑宽度当作整屏分辨率。
-    ratio = np.asarray(win.size, dtype=float) / np.asarray(win.clientSize, dtype=float)
-    win.keyboard_display_size = np.asarray((screen.width, screen.height)) * ratio
+    # PsychoPy 的 pix 刺激按客户区坐标定位。Retina 上 win.size 是双倍的
+    # framebuffer 尺寸；用它排版会把网格和顶部文字推出可见范围。
+    # 视角换算也必须采用相同坐标系中的整屏宽高。
+    win.keyboard_display_size = np.asarray((screen.width, screen.height), dtype=float)
     return win
+
+
+def _keyboard_coordinate_size(win: Any) -> np.ndarray:
+    """返回与 PsychoPy pix 刺激位置/尺寸相同的客户区坐标范围。"""
+    size = np.asarray(win.clientSize, dtype=float)
+    if size.shape != (2,) or not np.all(np.isfinite(size)) or np.any(size <= 0):
+        raise RuntimeError(f"无效的窗口客户区尺寸：{size}")
+    return size
 
 
 class KeyboardLayoutPreview:
@@ -2586,7 +2601,7 @@ class KeyboardLayoutPreview:
         self.accepted = False
         self.info: dict[str, Any] = {}
         self.error = ""
-        width, height = map(float, win.size)
+        width, height = _keyboard_coordinate_size(win)
         self.title = visual.TextStim(win, pos=(0, height / 2 - 22), height=22,
             wrapWidth=width - 40, color="white", autoLog=False)
         self.settings = visual.TextStim(win, pos=(0, height / 2 - 56), height=min(20, width / 60),
@@ -2604,7 +2619,8 @@ class KeyboardLayoutPreview:
     def refresh(self) -> None:
         self.error = ""
         try:
-            self.info = keyboard_layout_info(self.cfg, self.win.size, self.win.keyboard_display_size)
+            self.info = keyboard_layout_info(self.cfg, _keyboard_coordinate_size(self.win),
+                                             self.win.keyboard_display_size)
         except (ValueError, RuntimeError) as exc:
             # 字段操作保持可用；无效参数不渲染旧网格、不允许进入实验。
             self.info = {}
@@ -2717,6 +2733,9 @@ class KeyboardLayoutPreview:
 
     def result(self) -> dict[str, Any]:
         return {**self.info, "window_size_reported": list(map(int, self.win.size)),
+                "client_size_reported": list(map(int, self.win.clientSize)),
+                "framebuffer_size_reported": list(map(int, self.win.frameBufferSize)),
+                "content_scale_factor": self.win.getContentScaleFactor(),
                 "full_screen": bool(self.win.fullscr), "screen_index": self.cfg.screen_index,
                 "static_preview": {"confirmed": self.accepted,
                     "corners_checked": len(self.ratings),
@@ -2759,6 +2778,7 @@ class PsychoPyKeyboard:
         self.win: Any = None
         self.display_info: dict = {}
         self._pause_enabled = False
+        self._rest_beep: Any = None
         self._active_decode_cancel: Optional[threading.Event] = None
         self._decode_future: Any = None
         self._output_cache: Optional[str] = None
@@ -2777,7 +2797,7 @@ class PsychoPyKeyboard:
         visual, cfg = self.visual, self.cfg
         self.win = _create_keyboard_window(visual, cfg)
         self.win.mouseVisible = False
-        width, height = map(float, self.win.size)
+        width, height = _keyboard_coordinate_size(self.win)
         layout = keyboard_layout_info(cfg, (width, height), self.win.keyboard_display_size)
         if self.layout_preview and any(
                 not np.allclose(self.layout_preview[name], layout[name])
@@ -2877,6 +2897,7 @@ class PsychoPyKeyboard:
         content_scale = self.win.getContentScaleFactor() if hasattr(self.win, 'getContentScaleFactor') else None
         self.display_info = {**layout, "static_preview": self.layout_preview.get("static_preview"),
             "window_size_reported": tuple(map(int, self.win.size)),
+            "client_size_reported": tuple(map(int, self.win.clientSize)),
             "full_screen": bool(self.win.fullscr), "screen_index": cfg.screen_index,
             "window_backend": self.win.winType,
             "framebuffer_size_reported": tuple(map(int, framebuffer)), "content_scale_factor": content_scale,
@@ -3335,6 +3356,8 @@ class PsychoPyKeyboard:
                     "Free mode: keyboard SPACE pauses/resumes.\n"
                     f"Cued mode: SPACE starts; each target advances automatically after "
                     f"{self.cfg.cue_s:g} s cue and {self.cfg.cued_settle_s:g} s steady gaze. "
+                    f"Cued mode: rest {self.cfg.cued_rest_s:g} s after every "
+                    f"{self.cfg.cued_rest_every} completed targets, then resume automatically.\n"
                     "Block breaks and quality pauses require SPACE.\n"
                     "Blank bottom-left key: insert space.  <-: delete.\n"
                     "No automatic calibration or idle detection.")
@@ -3491,8 +3514,15 @@ class PsychoPyKeyboard:
     def _run_cued(self) -> str:
         cfg = self.cfg
         self._pause_enabled = False
+        # 在首个试次前准备音频，避免休息倒数期间才初始化音频设备。
+        try:
+            from psychopy import sound
+            self._rest_beep = sound.Sound(880, secs=0.15, volume=0.5, autoLog=False)
+        except Exception as exc:
+            raise RuntimeFault("AUDIO", f"模式2休息提示音初始化失败：{exc}") from exc
         schedule = deque(make_schedule(cfg.blocks, cfg.random_seed))
         consecutive_invalid = 0
+        completed_in_block = 0
         previous_block = 1
         stop_reason = "Completed planned trials"
         trial_id = 0
@@ -3504,6 +3534,7 @@ class PsychoPyKeyboard:
                     f"Minimum break: {cfg.block_rest_s:g} seconds.\n\nThen SPACE to continue; ESC to finish.",
                     cfg.block_rest_s, wait_space=True)
                 previous_block = block_id
+                completed_in_block = 0
             record = TrialRecord(trial_id, block_id, target_id, start=self.clock())
             fatal = False
             try:
@@ -3550,6 +3581,7 @@ class PsychoPyKeyboard:
                 self._persist_trial(record)
             if record.status == 'valid':
                 consecutive_invalid = 0
+                completed_in_block += 1
             else:
                 consecutive_invalid += 1
                 print(f"Trial {trial_id:03d}: {record.status.upper()} - {_brief_reason(record.reason)}", flush=True)
@@ -3566,9 +3598,52 @@ class PsychoPyKeyboard:
                     "Check the EEG stream, then press SPACE to continue; ESC to stop.",
                     cfg.feedback_s, wait_space=True)
                 consecutive_invalid = 0
+            if (record.status == 'valid' and completed_in_block % cfg.cued_rest_every == 0
+                    and schedule and schedule[0][0] == block_id):
+                self.header.text = (f"Block {block_id}/{cfg.blocks} | "
+                                    f"{completed_in_block}/{len(TARGETS)} targets complete")
+                self.footer.text = "Resting | No flicker | ESC: stop"
+                print(f"[模式2休息] 已完成{completed_in_block}个目标，休息{cfg.cued_rest_s:g}秒。",
+                      flush=True)
+                self._wait_cued_rest(completed_in_block)
         else:
             stop_reason = "Completed planned trials"
         return stop_reason
+
+    def _wait_cued_rest(self, completed_in_block: int) -> None:
+        """静态休息30秒；最后3、2、1秒各响一次，结束后自动继续。"""
+        duration = self.cfg.cued_rest_s
+        self._sync_output_text()
+        self.win.recordFrameIntervals = False
+        started = self.clock()
+        last_beep_second = None
+        try:
+            while True:
+                self._check_abort()
+                remaining = duration - (self.clock() - started)
+                if remaining <= 0:
+                    return
+                seconds_left = math.ceil(remaining)
+                if duration >= 3 and seconds_left in (3, 2, 1):
+                    if seconds_left != last_beep_second:
+                        try:
+                            self._rest_beep.play()
+                        except Exception as exc:
+                            raise RuntimeFault("AUDIO", f"模式2休息提示音播放失败：{exc}") from exc
+                        last_beep_second = seconds_left
+                    countdown = f"Resuming in {seconds_left}..."
+                else:
+                    countdown = f"Resuming automatically after {duration:g} seconds."
+                message = (f"{completed_in_block}/{len(TARGETS)} targets complete. "
+                           f"Rest your eyes.\n{countdown}\n\nESC: stop.")
+                if self.message.text != message:
+                    self.message.text = message
+                self._draw_status()
+                self.message.draw()
+                self.win.flip()
+        finally:
+            if self._rest_beep is not None:
+                self._rest_beep.stop()
 
     def close(self) -> None:
         self.cancel.set()

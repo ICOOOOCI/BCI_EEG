@@ -1,2 +1,0 @@
-# Python 3.10 compatibility; newer MNE-LSL releases require Python 3.11+.
-mne-lsl==1.12.0

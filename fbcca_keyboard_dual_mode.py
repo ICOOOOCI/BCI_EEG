@@ -18,6 +18,10 @@
 模式2另含质控JSON和个人模板PKL；导出失败时保留逐试次及连续数据分块。
 算法函数仍可import调用；import不会安装依赖或启动闪烁。
 实时EEG由MNE-LSL StreamLSL采集与缓冲，使用LSL内建时钟同步、去抖和单调化。
+默认按原流顺序使用前8个EEG通道CH1–CH8，不指定或推断头皮电极位置。
+--offline-session ZIP --offline-output DIR 可无UI/LSL重放并做分轮嵌套验证。
+start_keyboard_optimized.command 使用本次离线比较得到的历史陷波方案做新会话复测。
+--line-regression-hz 和 --response-delay 可显式配置工频回归及分析起点。
 
 UI API references checked 2026-09-17:
 https://psychopy.org/api/event.html
@@ -215,8 +219,9 @@ class Config:
     timestamp_jitter_grace_s: float = 0.5
     timestamp_max_discontinuity_s: float = 0.25
     timestamp_slew_rate_s_per_s: float = 0.01
-    channel_indices: tuple[int, ...] = (7, 6, 5, 4, 3, 1, 2, 0)
-    channel_positions: tuple[str, ...] = ("P1", "P2", "PO3", "POz", "PO4", "O1", "Oz", "O2")
+    channel_indices: tuple[int, ...] = tuple(range(8))
+    # 历史序列化字段名保留；新会话内容是通道编号，不是头皮位置。
+    channel_positions: tuple[str, ...] = tuple(f"CH{i + 1}" for i in range(8))
     buffer_s: float = 60.0
     connect_timeout_s: float = 10.0
     startup_timeout_s: float = 45.0
@@ -279,6 +284,11 @@ class Config:
     marker_stream_name: str = "FBCCA_40_Keyboard_Events"
     output_box_height_px: float = 72.0
     output_box_margin_px: float = 24.0
+
+    @property
+    def channel_labels(self) -> tuple[str, ...]:
+        """按真实LSL列号标注通道；不把历史位置名称当成当前接线。"""
+        return tuple(f"CH{index + 1}" for index in self.channel_indices)
 
     @property
     def window_s(self) -> float:
@@ -1340,7 +1350,7 @@ class PersonalCalibration:
         banks = []
         for x, window_fs in zip(windows, sampling_rates):
             x = _validate_eeg_ct(x)
-            if x.shape != (len(cfg.channel_positions), sample_count(cfg.window_s, window_fs)):
+            if x.shape != (len(cfg.channel_indices), sample_count(cfg.window_s, window_fs)):
                 raise ValueError("校准窗的通道数/长度与配置不一致；须提供已对齐的完整窗")
             bands = _validate_filter_bands(cfg.filter_bands, window_fs, cfg.target_fs)
             _validate_harmonics(cfg.n_harmonics, BENCHMARK_FREQUENCIES_HZ, window_fs)
@@ -1910,7 +1920,7 @@ class ContinuousLSL:
             self.fs = float(info.sfreq)
             _validate_fs(self.fs, max(high for _, high in self.cfg.filter_bands))
             if max(self.cfg.channel_indices) >= info.n_channels:
-                raise RuntimeError("所选LSL通道索引超出实际流通道数")
+                raise RuntimeError(f"EEG流通道不足：需要{len(self.cfg.channel_indices)}路，实际{info.n_channels}路")
             self.metadata = _parse_stream_metadata(info, self.cfg.channel_indices)
             self.metadata["all_channels"] = _parse_stream_metadata(
                 info, range(info.n_channels))["selected_channels"]
@@ -2452,6 +2462,8 @@ def _cued_quality_report(session: dict[str, Any], bundle: dict[str, Any],
         "freqs_hz": [target.frequency_hz for target in TARGETS],
         "channel_indices": session["config"]["channel_indices"],
         "channel_positions": session["config"]["channel_positions"],
+        "channel_labels": [f"CH{index + 1}" for index in session["config"]["channel_indices"]],
+        "electrode_positions_assumed": False,
         "online_decoder": session["algorithm"],
         "decoder_settings": session["decoder_settings"],
         "online_summary": session["summary"],
@@ -3066,6 +3078,8 @@ class SessionRecorder:
                     "array_layout": "channels x samples; each trial uses trial_NNNN_ prefixed keys",
                     "label_convention": "1-based true class; -1 means unknown (including free mode)",
                     "source_data_scope": "Selected LSL channels before receiver filtering; upstream processing may apply",
+                    "channel_labels": list(self.cfg.channel_labels),
+                    "electrode_positions_assumed": False,
                     "continuous_data_file": stem + "_continuous_eeg.npz",
                     "sync_report_file": stem + "_sync_report.json",
                 }
@@ -3078,6 +3092,7 @@ class SessionRecorder:
                     "has_eeg": np.asarray(has_eeg, dtype=bool),
                     "channel_indices": np.asarray(self.cfg.channel_indices, dtype=np.int64),
                     "channel_positions": np.asarray(self.cfg.channel_positions, dtype=str),
+                    "channel_labels": np.asarray(self.cfg.channel_labels, dtype=str),
                     "sampling_rates_hz": np.asarray([t["sampling_rate_hz"] or math.nan for t in trials]),
                     "target_fs_hz": self.cfg.target_fs,
                     "metadata_json": json.dumps(_json_safe(metadata), ensure_ascii=False, allow_nan=False),
@@ -3596,6 +3611,8 @@ def preflight_transport(cfg: Config, collector: ContinuousLSL) -> dict[str, Any]
         "stream_type": meta["type"],
         "channel_count": meta["channel_count"],
         "selected_channel_indices": list(cfg.channel_indices),
+        "selected_channel_labels": list(cfg.channel_labels),
+        "electrode_positions_assumed": False,
         "input_units": units,
         "unit_override": cfg.input_unit,
         "upstream_filter_description": cfg.upstream_filter_description,
@@ -3621,7 +3638,7 @@ def preflight_transport(cfg: Config, collector: ContinuousLSL) -> dict[str, Any]
         "device_timestamp_lag_applied_s": cfg.device_timestamp_lag_s,
     }
     print(f"LSL传输检查通过：{meta['name']} / {meta['type']}；"
-          f"通道{len(cfg.channel_indices)}/{meta['channel_count']}；"
+          f"使用{len(cfg.channel_indices)}路EEG（{'、'.join(cfg.channel_labels)}）；"
           f"声明{fs:g}Hz，观测{collector.estimated_fs:.3f}Hz；"
           f"最近{duration:.2f}秒通过连续性检查，最新样本{age:.3f}秒前。", flush=True)
     for warning in epoch.diagnostics.get("warnings", []):
@@ -3634,8 +3651,8 @@ def preflight_transport(cfg: Config, collector: ContinuousLSL) -> dict[str, Any]
               f"通道中位数={startup_mains['median_line_fraction']:.1%}。", flush=True)
         values = startup_mains["line_fraction_per_channel"]
         print("[各通道] " + "；".join(
-            f"{position}(CH{index + 1})=" + (f"{value:.1%}" if value is not None else "不可用")
-            for position, index, value in zip(cfg.channel_positions, cfg.channel_indices, values)),
+            f"{label}=" + (f"{value:.1%}" if value is not None else "不可用")
+            for label, value in zip(cfg.channel_labels, values)),
             flush=True)
         if startup_mains["line_dominated"]:
             print("[采集质量提示] 工频附近能量占比高，建议先检查参考/BIAS、电极接触与周围电源。"
@@ -5263,6 +5280,14 @@ def positive_seconds(value: str) -> float:
     return seconds
 
 
+def nonnegative_seconds(value: str) -> float:
+    """将命令行文本解析为允许零的有限非负秒数。"""
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError("seconds 必须是有限非负数")
+    return seconds
+
+
 def cli(argv=None) -> int:
     """Windows 与 macOS 共用的单文件命令行入口。"""
     configure_console()
@@ -5272,6 +5297,10 @@ def cli(argv=None) -> int:
     modes.add_argument("--check-lsl-timing", action="store_true",
                        help="不显示闪烁，连接EEG并检查LSL时间轴及滤波前工频占比")
     modes.add_argument("--self-test-ui", action="store_true", help="运行静态键盘自检")
+    modes.add_argument("--offline-session", type=Path, metavar="ZIP",
+                       help="离线分析已保存的会话ZIP；不连接LSL或启动显示界面")
+    parser.add_argument("--offline-output", type=Path, metavar="DIR",
+                        help="离线分析输出目录，仅配合--offline-session；默认offline_results")
     parser.add_argument("--seconds", type=positive_seconds, default=5.0,
                         help="静态自检展示或LSL预热后持续检查的秒数")
     parser.add_argument("--warmup-seconds", type=positive_seconds,
@@ -5290,6 +5319,12 @@ def cli(argv=None) -> int:
     parser.add_argument("--notch-mode", choices=("epoch", "history"),
                         help="epoch=原短窗陷波；history=使用前4秒真实源数据辅助陷波，"
                              "分析窗不变，仅支持无个人模板的FBCCA，需独立实测")
+    parser.add_argument("--line-regression-hz", type=positive_seconds, metavar="HZ",
+                        help="在每个分析窗回归去除指定工频的正弦/余弦；仅支持epoch，"
+                             "频率须为正且低于Nyquist，默认关闭")
+    parser.add_argument("--response-delay", type=nonnegative_seconds, metavar="SECONDS",
+                        help="从刺激软件事件到分析窗起点的延迟秒数，允许0；"
+                             "此值不是实测设备延迟，默认0.14")
     parser.add_argument("--protocol", choices=("standard_2s", "standard_5s", "paper_window_1p25s"),
                         help="分析窗长：2秒、5秒或论文1.25秒；仅改变窗长，不复刻论文完整时序")
     parser.add_argument("--seed", type=int, help="提示目标随机种子；不同复测可使用不同非负整数")
@@ -5300,6 +5335,23 @@ def cli(argv=None) -> int:
         parser.error("screen 必须非负")
     if args.seed is not None and args.seed < 0:
         parser.error("seed 必须非负")
+    if args.offline_output is not None and args.offline_session is None:
+        parser.error("--offline-output 必须配合 --offline-session")
+    if args.offline_session is not None:
+        try:
+            from offline_eeg_analysis import run as run_offline_analysis
+
+            output = (args.offline_output or Path("offline_results")).expanduser()
+            print(f"[离线分析] {args.offline_session.expanduser()}", flush=True)
+            run_offline_analysis(args.offline_session.expanduser(), output)
+            print(f"[离线分析完成] 输出目录：{output.resolve()}", flush=True)
+            return 0
+        except KeyboardInterrupt:
+            print("[离线分析] 已取消", file=sys.stderr, flush=True)
+            return 130
+        except Exception as exc:
+            print(f"[离线分析失败] {type(exc).__name__}：{exc}", file=sys.stderr, flush=True)
+            return 1
     report = {
         "mode": "static_ui" if args.self_test_ui else
                 "lsl_timing" if args.check_lsl_timing else "diagnose" if args.diagnose else "eeg",
@@ -5315,6 +5367,10 @@ def cli(argv=None) -> int:
             cfg.protocol = args.protocol
         if args.notch_mode:
             cfg.notch_mode = args.notch_mode
+        if args.line_regression_hz is not None:
+            cfg.line_regression_hz = args.line_regression_hz
+        if args.response_delay is not None:
+            cfg.response_delay_s = args.response_delay
         if args.seed is not None:
             cfg.random_seed = args.seed
         if args.windowed:

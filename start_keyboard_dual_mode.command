@@ -1,4 +1,6 @@
 #!/bin/bash
+# 离线：./start_keyboard_dual_mode.command --offline-session 会话.zip --offline-output 输出目录
+# 历史陷波复测：./start_keyboard_optimized.command
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd -- "$SCRIPT_DIR" || exit 10
 export PYTHONUTF8=1 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1

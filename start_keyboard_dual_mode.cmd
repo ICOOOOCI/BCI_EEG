@@ -5,7 +5,6 @@ cd /d "%~dp0"
 set "PYTHONUTF8=1"
 set "PYTHONUNBUFFERED=1"
 set "PYTHONDONTWRITEBYTECODE=1"
-if not defined FBCCA_QUICK_ENTRY set "FBCCA_QUICK_ENTRY=1"
 if exist "%~dp0.venv\Scripts\python.exe" (
     "%~dp0.venv\Scripts\python.exe" "%~dp0fbcca_keyboard_dual_mode.py" %*
 ) else (

@@ -2,7 +2,6 @@
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd -- "$SCRIPT_DIR" || exit 10
 export PYTHONUTF8=1 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
-export FBCCA_QUICK_ENTRY="${FBCCA_QUICK_ENTRY:-1}"
 if [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
     "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/fbcca_keyboard_dual_mode.py" "$@"
 elif command -v python3.10 >/dev/null 2>&1; then
